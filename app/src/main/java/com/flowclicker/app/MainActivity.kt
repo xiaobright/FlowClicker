@@ -62,6 +62,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnTasks).setOnClickListener {
             startActivity(Intent(this, com.flowclicker.app.ui.TaskListActivity::class.java))
         }
+        findViewById<Button>(R.id.btnAi).setOnClickListener {
+            startActivity(Intent(this, com.flowclicker.app.ui.AiActivity::class.java))
+        }
     }
 
     /**

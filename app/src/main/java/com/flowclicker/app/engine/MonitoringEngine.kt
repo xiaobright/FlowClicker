@@ -10,7 +10,22 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
+
+/** 引擎事件：供 AI 调度员（WakeDispatcher）等外部观察者消费 */
+sealed interface EngineEvent {
+    data class TaskFired(val taskId: Long, val name: String) : EngineEvent
+
+    data class TaskFinished(
+        val taskId: Long,
+        val name: String,
+        val stepsRan: Int,
+        val completed: Boolean,
+        val manual: Boolean,
+        val debugMode: Boolean,
+    ) : EngineEvent
+}
 
 /**
  * 监测引擎：实现"多任务并行监测、互斥执行"语义。
@@ -56,6 +71,33 @@ object MonitoringEngine {
     /** 任务集合发生任何变化（用户开关、执行后停用、控制步骤）时回调，用于持久化与界面刷新 */
     var onChanged: ((List<Task>) -> Unit)? = null
 
+    /** 引擎事件外发（触发/结束），WakeDispatcher 在此挂接唤醒规则 */
+    @Volatile
+    var eventListener: ((EngineEvent) -> Unit)? = null
+
+    /** debug 模式：每个点击/滑动步骤执行前回调（内部读取共享帧留存截图） */
+    @Volatile
+    var stepCapture: ((taskId: Long, stepIndex: Int) -> Unit)? = null
+
+    private val manualFire = AtomicReference<Task?>(null)
+
+    /** 试运行：把任务插入下一次引擎循环（互斥语义不变）；引擎未运行时返回 false */
+    fun requestRunNow(taskId: Long): Boolean {
+        if (!isMonitoring) return false
+        val t = tasks.firstOrNull { it.id == taskId } ?: return false
+        return manualFire.compareAndSet(null, t)
+    }
+
+    fun tasksSnapshot(): List<Task> = tasks.toList()
+
+    fun updateTasks(transform: (MutableList<Task>) -> Unit) {
+        val list = tasks.toMutableList()
+        transform(list)
+        tasks.clear()
+        tasks.addAll(list)
+        notifyChanged()
+    }
+
     private fun notifyChanged() {
         onChanged?.invoke(tasks.toList())
     }
@@ -94,8 +136,13 @@ object MonitoringEngine {
 
     private suspend fun monitorLoop() {
         while (isMonitoring) {
-            val fired = evaluateOnce()
-            if (!fired) delay(POLL_INTERVAL_MS)
+            val manual = manualFire.getAndSet(null)
+            if (manual != null) {
+                fireTask(manual, manual = true)
+            } else {
+                val fired = evaluateOnce()
+                if (!fired) delay(POLL_INTERVAL_MS)
+            }
         }
     }
 
@@ -116,7 +163,7 @@ object MonitoringEngine {
             if (!isMonitoring) return false
             val text = recognize(frame, task.trigger.region) ?: return false
             if (triggerMatched(text, task.trigger)) {
-                execute(task)
+                fireTask(task, manual = false)
                 return true
             }
         }
@@ -132,17 +179,27 @@ object MonitoringEngine {
         }
     }
 
-    private suspend fun execute(task: Task) {
+    private suspend fun fireTask(task: Task, manual: Boolean) {
+        val debug = task.mode == Task.MODE_DEBUG
+        Log.i(TAG, "task fired: ${task.name}${if (manual) " (manual)" else ""}, steps=${task.steps.size}")
+        eventListener?.invoke(EngineEvent.TaskFired(task.id, task.name))
         currentTaskName = task.name
-        Log.i(TAG, "task fired: ${task.name}, steps=${task.steps.size}")
+        var ran = 0
         try {
-            for (step in task.steps) {
-                if (!isMonitoring) return
+            for ((index, step) in task.steps.withIndex()) {
+                if (!isMonitoring) break
+                if (debug && (step is Step.Click || step is Step.Swipe)) {
+                    runCatching { stepCapture?.invoke(task.id, index) }
+                }
                 runStep(step)
+                ran++
             }
-            if (!task.loop) disableTask(task.id)
+            if (!task.loop && !manual) disableTask(task.id)
         } finally {
             currentTaskName = null
+            eventListener?.invoke(
+                EngineEvent.TaskFinished(task.id, task.name, ran, isMonitoring, manual, debug)
+            )
         }
     }
 

@@ -22,6 +22,7 @@ import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.flowclicker.app.R
+import com.flowclicker.app.ai.WakeDispatcher
 import com.flowclicker.app.core.GestureDispatcher
 import com.flowclicker.app.engine.Step
 import kotlinx.coroutines.CoroutineScope
@@ -272,6 +273,8 @@ class RecordingService : Service() {
             )
         }
         pendingResult = steps
+        lastRecording = steps
+        if (steps.isNotEmpty()) WakeDispatcher.onRecordingFinished(steps.size)
         stopSelf()
     }
 
@@ -306,5 +309,10 @@ class RecordingService : Service() {
         private var pendingResult: List<Step>? = null
 
         fun takeResult(): List<Step>? = pendingResult.also { pendingResult = null }
+
+        /** 最近一次完成录制的步骤（不消费），供 AI 调度员读取 */
+        @Volatile
+        var lastRecording: List<Step>? = null
+            private set
     }
 }

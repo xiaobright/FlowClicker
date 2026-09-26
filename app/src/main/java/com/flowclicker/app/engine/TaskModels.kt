@@ -69,6 +69,7 @@ sealed interface Step {
  * - tag：分组标签；被其他任务的 EnableTagged/DisableTagged 步骤批量控制
  * - loop：true=触发后重新武装可再次执行（挂机轮询型）；false=执行一次后自动停用
  * - priority：小者先评估，同帧多个任务匹配时高优先级（数值小）先执行
+ * - mode：normal=正常；debug=每次点击/滑动前留存截图供 AI 复盘，跑满轮数后唤醒调度员
  */
 @Serializable
 data class Task(
@@ -80,4 +81,10 @@ data class Task(
     val steps: List<Step> = emptyList(),
     val enabled: Boolean = true,
     val loop: Boolean = true,
-)
+    val mode: String = MODE_NORMAL,
+) {
+    companion object {
+        const val MODE_NORMAL = "normal"
+        const val MODE_DEBUG = "debug"
+    }
+}
