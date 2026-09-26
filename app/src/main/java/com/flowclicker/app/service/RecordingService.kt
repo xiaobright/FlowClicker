@@ -1,0 +1,310 @@
+package com.flowclicker.app.service
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.graphics.PixelFormat
+import android.os.Build
+import android.os.IBinder
+import android.os.SystemClock
+import android.content.pm.ServiceInfo
+import android.util.Log
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import com.flowclicker.app.R
+import com.flowclicker.app.core.GestureDispatcher
+import com.flowclicker.app.engine.Step
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+/**
+ * 序列录制：悬浮条 + 全屏触摸拦截层。
+ *
+ * 原理：用户的真实触摸落在拦截层上被记录；抬手后把这段手势经无障碍
+ * GestureDispatcher 转发给下层应用，转发期间拦截层临时置 FLAG_NOT_TOUCHABLE，
+ * 否则注入的手势会被自己拦下。因此目标应用画面正常推进，可连贯录制跨界面流程。
+ *
+ * 点击（位移<14px）记录为 Click（按压时长=实际按压时长），位移轨迹记录为
+ * Swipe（时长=实际时长），相邻两个动作的间隔记录为 delayAfterMs。
+ */
+class RecordingService : Service() {
+
+    private data class Sample(val x: Float, val y: Float)
+
+    private class GestureRecord(
+        val downT: Long,
+        val upT: Long,
+        val isTap: Boolean,
+        val points: List<Pair<Float, Float>>,   // 绝对屏幕坐标采样
+    )
+
+    private val wm by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val records = mutableListOf<GestureRecord>()
+
+    private var params: WindowManager.LayoutParams? = null
+    private var overlayRoot: LinearLayout? = null
+    private var tvTitle: TextView? = null
+    private var touchOffset = IntArray(2)
+
+    /** 待转发的手势数：>0 时拦截层保持不可触摸，全部完成后恢复 */
+    private var pendingForwards = 0
+
+    // 录制中的手势状态（主线程访问）
+    private var downT = 0L
+    private var startX = 0f
+    private var startY = 0f
+    private var maxDist = 0f
+    private val samples = mutableListOf<Pair<Float, Float>>()
+    private var lastSampleX = 0f
+    private var lastSampleY = 0f
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (overlayRoot == null) startNow()
+        return START_NOT_STICKY
+    }
+
+    private fun startNow() {
+        createChannel()
+        if (Build.VERSION.SDK_INT >= 34) {
+            ServiceCompat.startForeground(
+                this, NOTIF_ID, buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIF_ID, buildNotification())
+        }
+        buildOverlay()
+        Log.i(TAG, "recording overlay shown")
+    }
+
+    private fun buildOverlay() {
+        val dp = { v: Int -> (v * resources.displayMetrics.density).toInt() }
+
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(0xE6111827.toInt())
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        tvTitle = TextView(this).apply {
+            text = "录制中 · 0 步"
+            setTextColor(0xFFFFFFFF.toInt())
+            textSize = 15f
+        }
+        // 等宽按钮铺满悬浮条，位置可预测
+        fun barButton(text: String, onClick: () -> Unit): Button =
+            Button(this).apply {
+                this.text = text
+                textSize = 14f
+                isAllCaps = false
+                setOnClickListener {
+                    Log.i(TAG, "bar button clicked: $text")
+                    onClick()
+                }
+            }
+        bar.addView(
+            tvTitle,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f)
+        )
+        listOf("主屏" to { goHome() }, "完成" to { finishRecording() }, "取消" to { stopSelf() })
+            .forEach { (label, action) ->
+                bar.addView(
+                    barButton(label, action),
+                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                )
+            }
+
+        val touch = View(this).apply { setBackgroundColor(0x12000000) }
+        touch.setOnTouchListener { v, e -> onTouch(e, v) }
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(bar, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            addView(touch, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        }
+
+        val p = WindowManager.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP }
+        params = p
+        overlayRoot = root
+        wm.addView(root, p)
+        touch.post { touch.getLocationOnScreen(touchOffset) }
+    }
+
+    private fun goHome() {
+        startActivity(
+            Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_HOME)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+
+    private fun onTouch(e: MotionEvent, v: View): Boolean {
+        val now = SystemClock.uptimeMillis()
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downT = now
+                startX = e.x
+                startY = e.y
+                maxDist = 0f
+                samples.clear()
+                lastSampleX = e.x
+                lastSampleY = e.y
+                samples.add((e.x + touchOffset[0]) to (e.y + touchOffset[1]))
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val d = Math.hypot((e.x - startX).toDouble(), (e.y - startY).toDouble())
+                if (d > maxDist) maxDist = d.toFloat()
+                // 采样去重：距上一个采样点超过 15px 才记录，控制注入路径长度
+                if (Math.hypot((e.x - lastSampleX).toDouble(), (e.y - lastSampleY).toDouble()) > 15) {
+                    lastSampleX = e.x
+                    lastSampleY = e.y
+                    samples.add((e.x + touchOffset[0]) to (e.y + touchOffset[1]))
+                }
+            }
+
+            MotionEvent.ACTION_UP -> {
+                // 转发窗口内到达的触摸是刚注入手势的"回声"（标志传播间隙被自己拦下），丢弃
+                if (pendingForwards > 0) {
+                    Log.i(TAG, "echo gesture dropped (forwarding in progress)")
+                    return true
+                }
+                samples.add((e.x + touchOffset[0]) to (e.y + touchOffset[1]))
+                val dur = (now - downT).coerceIn(40, 60000)
+                val isTap = maxDist < 14f
+                records.add(GestureRecord(downT, now, isTap, samples.toList()))
+                tvTitle?.text = "录制中 · ${records.size} 步"
+                Log.i(TAG, "gesture #${records.size} recorded: tap=$isTap dur=${dur}ms samples=${samples.size}")
+                forward(isTap, dur)
+            }
+        }
+        return true
+    }
+
+    private fun forward(isTap: Boolean, dur: Long) {
+        val rec = records.last()
+        pendingForwards++
+        setTouchable(false)
+        scope.launch {
+            try {
+                // NOT_TOUCHABLE 标志传播到输入管线需要一两帧，先等待再注入，
+                // 否则转发手势会被自己的拦截层拦下
+                delay(80)
+                if (isTap) {
+                    val (x, y) = rec.points.first()
+                    GestureDispatcher.tap(x, y, dur.coerceIn(40, 1500))
+                } else {
+                    GestureDispatcher.strokePath(rec.points, dur.coerceIn(80, 60000))
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "forward failed", e)
+            } finally {
+                delay(40)
+                pendingForwards--
+                if (pendingForwards <= 0) {
+                    pendingForwards = 0
+                    setTouchable(true)
+                }
+            }
+        }
+    }
+
+    private fun setTouchable(touchable: Boolean) {
+        val v = overlayRoot ?: return
+        val p = params ?: return
+        p.flags = if (touchable) {
+            p.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+        } else {
+            p.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        }
+        runCatching { wm.updateViewLayout(v, p) }
+    }
+
+    private fun finishRecording() {
+        Log.i(TAG, "finish requested, recorded=${records.size}")
+        val steps = mutableListOf<Step>()
+        var prevEnd = -1L
+        for (r in records) {
+            val gap = if (prevEnd < 0) 500L else (r.downT - prevEnd).coerceIn(80, 15000)
+            prevEnd = r.upT
+            val dur = r.upT - r.downT
+            val first = r.points.first()
+            val last = r.points.last()
+            steps.add(
+                if (r.isTap) {
+                    Step.Click(
+                        x = first.first, y = first.second,
+                        maxOffsetPx = 4f,
+                        pressMs = dur.coerceIn(40, 1200), pressJitterMs = 15,
+                        delayAfterMs = gap, delayJitterMs = 200,
+                    )
+                } else {
+                    Step.Swipe(
+                        x1 = first.first, y1 = first.second,
+                        x2 = last.first, y2 = last.second,
+                        durationMs = dur.coerceIn(80, 60000), durationJitterMs = 60,
+                        delayAfterMs = gap, delayJitterMs = 200,
+                    )
+                }
+            )
+        }
+        pendingResult = steps
+        stopSelf()
+    }
+
+    override fun onDestroy() {
+        overlayRoot?.let { runCatching { wm.removeView(it) } }
+        overlayRoot = null
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    private fun buildNotification(): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_notify)
+            .setContentTitle("正在录制操作序列")
+            .setContentText("在目标应用上操作，完成后点悬浮条上的「完成」")
+            .setOngoing(true)
+            .build()
+
+    private fun createChannel() {
+        val channel = NotificationChannel(
+            CHANNEL_ID, "序列录制", NotificationManager.IMPORTANCE_LOW
+        )
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+    }
+
+    companion object {
+        private const val TAG = "RecordingService"
+        private const val CHANNEL_ID = "record"
+        private const val NOTIF_ID = 1002
+
+        @Volatile
+        private var pendingResult: List<Step>? = null
+
+        fun takeResult(): List<Step>? = pendingResult.also { pendingResult = null }
+    }
+}

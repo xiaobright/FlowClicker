@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">流程点击器</string>
+
+    <string name="accessibility_service_label">流程点击器 · 自动点击引擎</string>
+    <string name="accessibility_service_summary">用于实现自动点击、滑动与屏幕检测</string>
+    <string name="accessibility_service_description">本服务用于派发点击/滑动手势，是自动点击功能的核心。开启后即可运行挂机任务。</string>
+
+    <string name="title_permission">权限设置</string>
+    <string name="btn_accessibility">1. 开启无障碍服务</string>
+    <string name="btn_overlay">2. 授予悬浮窗权限</string>
+    <string name="btn_capture_start">3. 开启屏幕采集（录屏）</string>
+    <string name="btn_capture_stop">停止屏幕采集</string>
+    <string name="btn_test">测试：OCR识别 → 自动点击（全链路）</string>
+    <string name="btn_tasks">任务管理（模块编排）</string>
+    <string name="btn_new_task">＋ 新建任务</string>
+    <string name="btn_pick_region">框选区域</string>
+    <string name="btn_clear_region">全屏（清空）</string>
+    <string name="btn_record">● 录制操作序列（悬浮窗）</string>
+    <string name="btn_start_monitor">启动监测</string>
+    <string name="btn_stop_monitor">停止监测</string>
+    <string name="hint_task_list">模块结构：常驻任务（如重新登录）序列末尾放"启用标签组"，被启用标签的任务自动衔接在其后执行；关卡特殊操作=单独任务，触发词填关卡名。</string>
+    <string name="status_ready">状态：未就绪</string>
+    <string name="hint_roadmap">里程碑规划：\n① 骨架与权限（当前）\n② OCR 文字识别与匹配\n③ 单任务 触发→分支点击\n④ 坐标录制与随机偏移\n⑤ 多任务并行监测、互斥执行</string>
+</resources>
