@@ -30,6 +30,9 @@ sealed interface Step {
     data class Click(
         val x: Float,
         val y: Float,
+        /** OCR 锚点文字：非空时执行前实时识别屏幕，点击包含该文字的文本框中心；未命中回退 x,y */
+        val anchor: String? = null,
+        val anchorFallback: Boolean = false,
         val maxOffsetPx: Float = 0f,
         val pressMs: Long = 60,
         val pressJitterMs: Long = 0,
@@ -53,6 +56,15 @@ sealed interface Step {
     @Serializable
     @SerialName("wait")
     data class Wait(val ms: Long) : Step
+
+    @Serializable
+    @SerialName("wait_text")
+    data class WaitText(
+        val text: String,
+        val present: Boolean = true,
+        val timeoutMs: Long = 10000,
+        val region: Region? = null,
+    ) : Step
 
     @Serializable
     @SerialName("enable_tagged")
@@ -82,6 +94,8 @@ data class Task(
     val enabled: Boolean = true,
     val loop: Boolean = true,
     val mode: String = MODE_NORMAL,
+    /** Definition version; toggling enabled/mode does not invalidate execution evidence. */
+    val revision: Long = 0,
 ) {
     companion object {
         const val MODE_NORMAL = "normal"

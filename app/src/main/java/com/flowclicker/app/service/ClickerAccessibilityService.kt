@@ -18,6 +18,7 @@ class ClickerAccessibilityService : AccessibilityService() {
     override fun onInterrupt() = Unit
 
     override fun onDestroy() {
+        com.flowclicker.app.ai.WakeDispatcher.stopAll()
         GestureDispatcher.detach(this)
         instance = null
         super.onDestroy()

@@ -91,7 +91,7 @@ class AiActivity : AppCompatActivity() {
 
     private fun renderLog() {
         val log = AiStores.loadLog()
-        tvLog.text = if (log.isEmpty()) {
+        val body = if (log.isEmpty()) {
             "暂无调度记录"
         } else {
             val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.US)
@@ -99,5 +99,9 @@ class AiActivity : AppCompatActivity() {
                 "[${fmt.format(Date(e.time))}] ${e.eventType}（工具${e.toolCalls}次）\n${e.detail}\n→ ${e.reply}"
             }
         }
+        val memory = AiStores.loadMemory()
+        val memBlock = if (memory.isEmpty()) "" else
+            "【AI 长期记忆】\n" + memory.joinToString("\n") { "· ${it.text}" } + "\n\n————————\n\n"
+        tvLog.text = memBlock + body
     }
 }

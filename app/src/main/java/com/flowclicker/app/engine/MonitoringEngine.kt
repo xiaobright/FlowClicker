@@ -1,250 +1,275 @@
 package com.flowclicker.app.engine
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import android.util.Log
 import com.flowclicker.app.core.GestureDispatcher
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import java.util.concurrent.CopyOnWriteArrayList
+import com.flowclicker.app.core.ScreenControl
+import kotlinx.coroutines.*
+import kotlinx.serialization.Serializable
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
 
-/** 引擎事件：供 AI 调度员（WakeDispatcher）等外部观察者消费 */
 sealed interface EngineEvent {
     data class TaskFired(val taskId: Long, val name: String) : EngineEvent
-
     data class TaskFinished(
-        val taskId: Long,
-        val name: String,
-        val stepsRan: Int,
-        val completed: Boolean,
-        val manual: Boolean,
-        val debugMode: Boolean,
+        val taskId: Long, val name: String, val stepsRan: Int,
+        val completed: Boolean, val manual: Boolean, val debugMode: Boolean,
+        val result: RunResult,
     ) : EngineEvent
 }
 
-/**
- * 监测引擎：实现"多任务并行监测、互斥执行"语义。
- *
- * - 单线程监测循环内按 priority（小者优先）逐帧评估所有启用任务；
- * - 任一任务条件满足 → 依次执行其动作序列，期间循环阻塞，其他任务不会触发；
- * - 序列执行完毕后回到监测循环，触发重新武装；
- * - 所有任务的文字识别共享同一帧截图，避免跨任务读到不同时刻的画面。
- */
+@Serializable
+data class RunResult(
+    val taskId: Long, val revision: Long, val runId: String,
+    val stepsRan: Int, val completed: Boolean, val verified: Boolean,
+    val reason: String? = null,
+)
+
+/** One serialized state writer and one cancellable local runner. */
 object MonitoringEngine {
-
-    private const val TAG = "MonitoringEngine"
-    private const val POLL_INTERVAL_MS = 500L
-
+    private val stateLock = Any()
+    private val lifecycleLock = Any()
+    private var tasks: List<Task> = emptyList()
     private var scope: CoroutineScope? = null
-    private val tasks = CopyOnWriteArrayList<Task>()
-
-    @Volatile
-    var isMonitoring = false
+    private var generation = 0L
+    private val manualFire = AtomicReference<Long?>(null)
+    private val reviewPending = mutableSetOf<Long>()
+    private val results = mutableMapOf<Long, RunResult>()
+    @Volatile var loadError: String? = null
+    @Volatile var isMonitoring = false
         private set
-
-    @Volatile
-    var currentTaskName: String? = null
+    @Volatile var currentTaskName: String? = null
         private set
-
-    /** 供各任务共享的最新屏幕帧，由录屏服务注入 */
-    @Volatile
-    var frameProvider: (() -> Bitmap?)? = null
-
-    /**
-     * OCR 钩子：由宿主注入（FlowClickerApp 接 ML Kit）。
-     * 参数为共享帧与任务检测区域，返回区域内的识别文本；为 null 表示本帧不可用。
-     */
-    @Volatile
-    var textRecognizer: (suspend (frame: Bitmap?, region: Region?) -> String?)? = null
-
-    fun setTasks(list: List<Task>) {
-        tasks.clear()
-        tasks.addAll(list)
-        notifyChanged()
-    }
-
-    /** 任务集合发生任何变化（用户开关、执行后停用、控制步骤）时回调，用于持久化与界面刷新 */
+    @Volatile var frameProvider: (() -> Bitmap?)? = null
+    @Volatile var textRecognizer: (suspend (Bitmap?, Region?) -> String?)? = null
+    @Volatile var textLocator: (suspend (Bitmap?, Region?) -> List<OcrBox>)? = null
     var onChanged: ((List<Task>) -> Unit)? = null
+    @Volatile var eventListener: ((EngineEvent) -> Unit)? = null
+    /** stepIndex=-1 means the final, post-action frame. */
+    @Volatile var stepCapture: ((Long, Int) -> Unit)? = null
 
-    /** 引擎事件外发（触发/结束），WakeDispatcher 在此挂接唤醒规则 */
-    @Volatile
-    var eventListener: ((EngineEvent) -> Unit)? = null
+    /** Initialization only. All subsequent changes use updateTasks. */
+    fun setTasks(list: List<Task>) = synchronized(stateLock) { tasks = list.toList() }
+    fun tasksSnapshot(): List<Task> = synchronized(stateLock) { tasks.toList() }
+    fun lastResult(id: Long): RunResult? = synchronized(stateLock) { results[id] }
+    fun pendingReviews(): List<Long> = synchronized(stateLock) { reviewPending.toList() }
+    fun holdForReview(id: Long) = synchronized(stateLock) { reviewPending.add(id); Unit }
 
-    /** debug 模式：每个点击/滑动步骤执行前回调（内部读取共享帧留存截图） */
-    @Volatile
-    var stepCapture: ((taskId: Long, stepIndex: Int) -> Unit)? = null
-
-    private val manualFire = AtomicReference<Task?>(null)
-
-    /** 试运行：把任务插入下一次引擎循环（互斥语义不变）；引擎未运行时返回 false */
-    fun requestRunNow(taskId: Long): Boolean {
-        if (!isMonitoring) return false
-        val t = tasks.firstOrNull { it.id == taskId } ?: return false
-        return manualFire.compareAndSet(null, t)
-    }
-
-    fun tasksSnapshot(): List<Task> = tasks.toList()
-
-    fun updateTasks(transform: (MutableList<Task>) -> Unit) {
+    fun updateTasks(transform: (MutableList<Task>) -> Unit) = synchronized(stateLock) {
+        check(loadError == null) { "任务文件加载失败，请先恢复备份，禁止覆盖：$loadError" }
         val list = tasks.toMutableList()
         transform(list)
-        tasks.clear()
-        tasks.addAll(list)
-        notifyChanged()
-    }
-
-    private fun notifyChanged() {
-        onChanged?.invoke(tasks.toList())
-    }
-
-    private fun setTagEnabled(tag: String, enabled: Boolean) {
-        var changed = false
-        for (i in tasks.indices) {
-            val t = tasks[i]
-            if (t.tag == tag && t.enabled != enabled) {
-                tasks[i] = t.copy(enabled = enabled)
-                changed = true
+        require(list.map { it.id }.distinct().size == list.size) { "任务 ID 重复" }
+        val next = list.map { t ->
+            val old = tasks.firstOrNull { it.id == t.id }
+            if (old != t) TaskValidation.validate(t)
+            val changed = old == null || old.copy(enabled = t.enabled, mode = t.mode, revision = t.revision) != t
+            t.copy(revision = if (changed) (old?.revision ?: 0) + 1 else old!!.revision)
+        }
+        // Commit bytes before publishing memory. Write failure is surfaced to caller.
+        onChanged?.invoke(next)
+        for (t in next) {
+            val old = tasks.firstOrNull { it.id == t.id }
+            if (old == null || old.revision != t.revision || old.mode != t.mode || old.enabled != t.enabled) {
+                reviewPending.remove(t.id)
             }
         }
-        if (changed) {
-            Log.i(TAG, "tag '$tag' -> enabled=$enabled")
-            notifyChanged()
+        val ids = next.map { it.id }.toSet()
+        reviewPending.retainAll(ids)
+        results.keys.retainAll(ids)
+        tasks = next
+    }
+
+    fun promote(id: Long) = synchronized(stateLock) {
+        val t = tasks.firstOrNull { it.id == id } ?: error("任务不存在")
+        val r = results[id]
+        check(r != null && r.revision == t.revision && r.completed && r.verified) {
+            "不能转正：当前版本须成功试跑，且最后一步 wait_text 验证通过"
+        }
+        updateTasks { list -> val i = list.indexOfFirst { it.id == id }; list[i] = list[i].copy(mode = Task.MODE_NORMAL) }
+    }
+
+    fun requestRunNow(taskId: Long): Boolean {
+        if (!isMonitoring || tasksSnapshot().none { it.id == taskId }) return false
+        return manualFire.compareAndSet(null, taskId)
+    }
+
+    fun start() = synchronized(lifecycleLock) {
+        check(loadError == null) { "任务文件异常：$loadError" }
+        check(GestureDispatcher.isReady) { "请先开启无障碍服务" }
+        val frame = frameProvider?.invoke() ?: error("请先开启屏幕采集并等待画面")
+        frame.recycle()
+        if (isMonitoring) return@synchronized
+        isMonitoring = true
+        val token = ++generation
+        scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also { s ->
+            s.launch {
+                try {
+                    while (currentCoroutineContext().isActive) {
+                        ScreenControl.withOwner("engine") {
+                            val id = manualFire.getAndSet(null)
+                            if (id != null) tasksSnapshot().firstOrNull { it.id == id }?.let { runTask(it, true) }
+                            else evaluateOnce()
+                        }
+                        delay(500)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.e("MonitoringEngine", "runner stopped", e)
+                } finally {
+                    synchronized(lifecycleLock) {
+                        if (generation == token) { isMonitoring = false; currentTaskName = null; scope = null }
+                    }
+                }
+            }
         }
     }
 
-    fun start() {
-        if (isMonitoring) return
-        isMonitoring = true
-        val s = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        scope = s
-        s.launch { monitorLoop() }
-        Log.i(TAG, "monitoring started, tasks=${tasks.size}")
-    }
-
-    fun stop() {
+    fun stop() = synchronized(lifecycleLock) {
+        ++generation
         isMonitoring = false
+        manualFire.set(null)
         scope?.cancel()
         scope = null
         currentTaskName = null
-        Log.i(TAG, "monitoring stopped")
     }
 
-    private suspend fun monitorLoop() {
-        while (isMonitoring) {
-            val manual = manualFire.getAndSet(null)
-            if (manual != null) {
-                fireTask(manual, manual = true)
-            } else {
-                val fired = evaluateOnce()
-                if (!fired) delay(POLL_INTERVAL_MS)
-            }
-        }
+    /** Does not mutate the library or start monitoring other tasks. */
+    suspend fun preview(task: Task): RunResult = ScreenControl.withOwner("preview") {
+        check(!isMonitoring) { "请先停止引擎再进行临时测试" }
+        runTask(task, manual = true, transient = true)
     }
 
-    /** @return 本轮是否触发了任务 */
-    private suspend fun evaluateOnce(): Boolean {
-        val active = tasks.filter { it.enabled }.sortedBy { it.priority }
-        if (active.isEmpty()) {
-            Log.i(TAG, "no enabled tasks left, engine stops")
-            stop()
-            return false
+    private suspend fun evaluateOnce() {
+        val active = synchronized(stateLock) {
+            tasks.filter { it.enabled && it.id !in reviewPending }.sortedBy { it.priority }
         }
-
-        // 一轮评估只取一帧，所有任务基于同一时刻的屏幕状态决策
-        val recognize = textRecognizer ?: return false
-        val frame = frameProvider?.invoke()
-
-        for (task in active) {
-            if (!isMonitoring) return false
-            val text = recognize(frame, task.trigger.region) ?: return false
-            if (triggerMatched(text, task.trigger)) {
-                fireTask(task, manual = false)
-                return true
-            }
-        }
-        return false
-    }
-
-    private fun triggerMatched(screenText: String, trigger: Trigger): Boolean {
-        if (trigger.keywords.isEmpty()) return false
-        val hay = if (trigger.ignoreCase) screenText.lowercase() else screenText
-        return trigger.keywords.any { kw ->
-            val needle = if (trigger.ignoreCase) kw.lowercase() else kw
-            hay.contains(needle)
-        }
-    }
-
-    private suspend fun fireTask(task: Task, manual: Boolean) {
-        val debug = task.mode == Task.MODE_DEBUG
-        Log.i(TAG, "task fired: ${task.name}${if (manual) " (manual)" else ""}, steps=${task.steps.size}")
-        eventListener?.invoke(EngineEvent.TaskFired(task.id, task.name))
-        currentTaskName = task.name
-        var ran = 0
+        if (active.isEmpty()) return
+        val frame = frameProvider?.invoke() ?: error("屏幕采集已停止")
         try {
+            val cache = mutableMapOf<Region?, String?>()
+            for (task in active) {
+                currentCoroutineContext().ensureActive()
+                val text = if (cache.containsKey(task.trigger.region)) cache[task.trigger.region]
+                    else textRecognizer?.invoke(frame, task.trigger.region).also { cache[task.trigger.region] = it }
+                if (text != null && task.trigger.keywords.any { it.isNotBlank() && text.contains(it, task.trigger.ignoreCase) }) {
+                    val latest = tasksSnapshot().firstOrNull { it.id == task.id }
+                    if (latest?.enabled == true && latest.revision == task.revision) runTask(task, false)
+                    return
+                }
+            }
+        } finally { frame.recycle() }
+    }
+
+    private suspend fun runTask(task: Task, manual: Boolean, transient: Boolean = false): RunResult {
+        var ran = 0
+        var completed = false
+        var reason: String? = null
+        val runId = "${System.currentTimeMillis()}-${task.id}"
+        currentTaskName = task.name
+        if (!transient) emit(EngineEvent.TaskFired(task.id, task.name))
+        try {
+            TaskValidation.validate(task)
             for ((index, step) in task.steps.withIndex()) {
-                if (!isMonitoring) break
-                if (debug && (step is Step.Click || step is Step.Swipe)) {
+                currentCoroutineContext().ensureActive()
+                if (!transient) {
+                    val latest = tasksSnapshot().firstOrNull { it.id == task.id }
+                    check(latest != null && latest.revision == task.revision && (manual || latest.enabled)) {
+                        "任务已修改、删除或停用"
+                    }
+                }
+                if (task.mode == Task.MODE_DEBUG && (step is Step.Click || step is Step.Swipe)) {
                     runCatching { stepCapture?.invoke(task.id, index) }
                 }
                 runStep(step)
                 ran++
             }
-            if (!task.loop && !manual) disableTask(task.id)
+            if (!transient && !task.loop && !manual) updateTasks { list ->
+                val i = list.indexOfFirst { it.id == task.id }
+                if (i >= 0) list[i] = list[i].copy(enabled = false)
+            }
+            completed = true
+        } catch (e: CancellationException) {
+            reason = "已取消"
+            throw e
+        } catch (e: Exception) {
+            reason = e.message ?: e.javaClass.simpleName
+            Log.w("MonitoringEngine", "task failed: ${task.id}: $reason")
         } finally {
             currentTaskName = null
-            eventListener?.invoke(
-                EngineEvent.TaskFinished(task.id, task.name, ran, isMonitoring, manual, debug)
-            )
+            if (!transient && task.mode == Task.MODE_DEBUG) runCatching { stepCapture?.invoke(task.id, -1) }
+            val result = RunResult(task.id, task.revision, runId, ran, completed,
+                completed && task.steps.lastOrNull() is Step.WaitText, reason)
+            if (!transient) {
+                synchronized(stateLock) {
+                    results[task.id] = result
+                    if (!completed) reviewPending.add(task.id)
+                }
+                emit(EngineEvent.TaskFinished(task.id, task.name, ran, completed, manual,
+                    task.mode == Task.MODE_DEBUG, result))
+            }
         }
+        return RunResult(task.id, task.revision, runId, ran, completed,
+            completed && task.steps.lastOrNull() is Step.WaitText, reason)
     }
 
-    private fun disableTask(id: Long) {
-        val index = tasks.indexOfFirst { it.id == id }
-        if (index >= 0) {
-            tasks[index] = tasks[index].copy(enabled = false)
-            notifyChanged()
-        }
+    private fun emit(e: EngineEvent) {
+        runCatching { eventListener?.invoke(e) }.onFailure { Log.w("MonitoringEngine", "event failed", it) }
     }
 
     private suspend fun runStep(step: Step) {
         when (step) {
             is Step.Click -> {
-                val (x, y) = applyOffset(step.x, step.y, step.maxOffsetPx)
-                GestureDispatcher.tap(x, y, jitter(step.pressMs, step.pressJitterMs))
+                val (x, y) = resolveClickTarget(step)
+                check(GestureDispatcher.tap(
+                    x + Random.nextFloat() * step.maxOffsetPx * 2 - step.maxOffsetPx,
+                    y + Random.nextFloat() * step.maxOffsetPx * 2 - step.maxOffsetPx,
+                    jitter(step.pressMs, step.pressJitterMs).coerceAtLeast(1)
+                )) { "点击未派发或被取消" }
                 delay(jitter(step.delayAfterMs, step.delayJitterMs).coerceAtLeast(0))
             }
-
             is Step.Swipe -> {
-                GestureDispatcher.swipe(
-                    step.x1, step.y1, step.x2, step.y2,
-                    jitter(step.durationMs, step.durationJitterMs)
-                )
+                check(GestureDispatcher.swipe(step.x1, step.y1, step.x2, step.y2,
+                    jitter(step.durationMs, step.durationJitterMs).coerceAtLeast(1))) { "滑动未派发或被取消" }
                 delay(jitter(step.delayAfterMs, step.delayJitterMs).coerceAtLeast(0))
             }
-
-            is Step.Wait -> delay(step.ms.coerceAtLeast(0))
-
-            is Step.EnableTagged -> setTagEnabled(step.tag, true)
-
-            is Step.DisableTagged -> setTagEnabled(step.tag, false)
+            is Step.Wait -> delay(step.ms)
+            is Step.WaitText -> {
+                val deadline = SystemClock.elapsedRealtime() + step.timeoutMs
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val frame = frameProvider?.invoke() ?: error("验证时屏幕采集不可用")
+                    val text = try { textRecognizer?.invoke(frame, step.region) } finally { frame.recycle() }
+                    if (text != null && text.contains(step.text, true) == step.present) break
+                    check(SystemClock.elapsedRealtime() < deadline) { "等待文字${if (step.present) "出现" else "消失"}超时：${step.text}" }
+                    delay(300)
+                }
+            }
+            is Step.EnableTagged -> setTag(step.tag, true)
+            is Step.DisableTagged -> setTag(step.tag, false)
         }
     }
 
-    /** base ± jitter 内的随机值；jitter<=0 时返回 base */
-    private fun jitter(base: Long, jitterMs: Long): Long {
-        if (jitterMs <= 0) return base
-        return base + Random.nextLong(-jitterMs, jitterMs + 1)
+    private fun setTag(tag: String, enabled: Boolean) = updateTasks { list ->
+        list.indices.forEach { i -> if (list[i].tag == tag) list[i] = list[i].copy(enabled = enabled) }
     }
 
-    private fun applyOffset(x: Float, y: Float, maxOffset: Float): Pair<Float, Float> {
-        if (maxOffset <= 0f) return x to y
-        val dx = (Random.nextFloat() - 0.5f) * 2f * maxOffset
-        val dy = (Random.nextFloat() - 0.5f) * 2f * maxOffset
-        return x + dx to y + dy
+    private suspend fun resolveClickTarget(step: Step.Click): Pair<Float, Float> {
+        val anchor = step.anchor?.trim().orEmpty()
+        if (anchor.isEmpty()) return step.x to step.y
+        val frame = frameProvider?.invoke() ?: error("锚点定位时无可用画面")
+        val hits = try {
+            textLocator?.invoke(frame, null).orEmpty().filter {
+                it.text.replace(" ", "").contains(anchor.replace(" ", ""), true)
+            }
+        } finally { frame.recycle() }
+        if (hits.size == 1) return hits[0].centerX.toFloat() to hits[0].centerY.toFloat()
+        check(step.anchorFallback) { "锚点「$anchor」未找到或有多个匹配，已停止而非盲点旧坐标" }
+        return step.x to step.y
     }
+
+    private fun jitter(base: Long, amount: Long): Long =
+        if (amount <= 0) base else base + Random.nextLong(-amount, amount + 1)
 }

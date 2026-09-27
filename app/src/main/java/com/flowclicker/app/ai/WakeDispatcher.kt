@@ -2,178 +2,186 @@ package com.flowclicker.app.ai
 
 import android.os.SystemClock
 import android.util.Log
-import com.flowclicker.app.engine.EngineEvent.TaskFired
-import com.flowclicker.app.engine.EngineEvent.TaskFinished
+import com.flowclicker.app.core.ScreenControl
+import com.flowclicker.app.engine.EngineEvent
 import com.flowclicker.app.engine.MonitoringEngine
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 
-/**
- * 唤醒调度器：收集引擎/录制/试运行/debug 事件，按唤醒规则触发 AI 会话。
- * - 单飞：同一时刻最多一个会话（Mutex），事件排队上限 5；
- * - idle 看门狗：引擎运行但持续无任务触发超时 → 唤醒；
- * - stall 看门狗：任务执行完后超时无任何其他任务接续 → 唤醒；
- * - debug 轮次：debug 任务跑满 settings.debugRounds 轮 → 带截图唤醒复盘。
- */
+/** One consumer, bounded/coalesced events, and explicit cancellation of an AI generation. */
 object WakeDispatcher {
-
-    private const val TAG = "WakeDispatcher"
-
-    data class WakeEvent(val type: String, val detail: String, val taskId: Long? = null)
-
+    data class WakeEvent(
+        val type: String, val detail: String, val taskId: Long? = null,
+        val createdAt: Long = SystemClock.elapsedRealtime(), val epoch: Long = 0,
+    )
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val mutex = Mutex()
-    private val pending = Channel<WakeEvent>(Channel.UNLIMITED)
-
-    @Volatile
+    private val guard = Any()
+    private val signal = Channel<Unit>(Channel.CONFLATED)
+    private val pending = WakeQueue<WakeEvent>(5) { "${it.epoch}:${it.type}:${it.taskId}:${if (it.type == "manual") it.detail else ""}" }
+    private var active: Job? = null
+    @Volatile private var epoch = 0L
+    @Volatile private var suspendedByUser = false
+    @Volatile var status = "空闲"
+        private set
     private var lastActivity = SystemClock.elapsedRealtime()
-    private val stallJobs = mutableMapOf<Long, Job>()
-    private val debugRounds = mutableMapOf<Long, Int>()
+    private val taskActivity = mutableMapOf<Long, Long>()
+    private val rounds = mutableMapOf<Long, Pair<Long, Int>>()
+    private val stalls = StallWatch()
 
     fun init() {
-        MonitoringEngine.eventListener = { onEngineEvent(it) }
-        scope.launch { idleWatchLoop() }
-    }
-
-    fun onEngineEvent(e: com.flowclicker.app.engine.EngineEvent) {
-        when (e) {
-            is TaskFired -> {
-                lastActivity = SystemClock.elapsedRealtime()
-                stallJobs.values.forEach { it.cancel() }
-                stallJobs.clear()
-            }
-
-            is TaskFinished -> {
-                lastActivity = SystemClock.elapsedRealtime()
-                if (e.manual) {
-                    enqueue(
-                        WakeEvent(
-                            "test_run_finished",
-                            "任务「${e.name}」试运行结束：执行 ${e.stepsRan} 步，正常完成=${e.completed}。" +
-                                    "请 get_debug_captures(taskId=${e.taskId}) 复盘截图后再决定转正或修改",
-                            e.taskId
-                        )
-                    )
-                    return
-                }
-                scheduleStallWatch(e)
-                handleDebugRounds(e)
-            }
-        }
-    }
-
-    /** 用户/其他模块完成一次录制 */
-    fun onRecordingFinished(stepCount: Int) {
-        enqueue(
-            WakeEvent(
-                "recording_finished",
-                "完成了一次 $stepCount 步的操作录制。请 get_last_recording 读取手势序列，" +
-                        "结合上下文整理为正式任务（补充触发词/标签/兜底规则，默认 debug 模式）"
-            )
-        )
-    }
-
-    /** 用户在 AI 界面手动提问/下达指令；AI 未启用或未配置时返回 false */
-    fun manual(text: String): Boolean {
-        val s = AiStores.loadSettings()
-        if (!s.enabled || s.baseUrl.isBlank() || s.model.isBlank()) return false
-        enqueue(WakeEvent("manual", "用户指令：$text"))
-        return true
-    }
-
-    private suspend fun idleWatchLoop() {
-        while (true) {
-            delay(5_000)
-            runCatching {
-                val settings = AiStores.loadSettings()
-                if (!settings.enabled) return@runCatching
-                val idleRules = AiStores.loadRules().filter { it.type == "idle" }
-                if (idleRules.isEmpty() || !MonitoringEngine.isMonitoring) return@runCatching
-                if (MonitoringEngine.tasksSnapshot().none { it.enabled }) return@runCatching
-                val timeout = idleRules.minOf { it.timeoutMs }.coerceAtLeast(10_000)
-                if (SystemClock.elapsedRealtime() - lastActivity > timeout) {
-                    lastActivity = SystemClock.elapsedRealtime()
-                    enqueue(
-                        WakeEvent(
-                            "idle",
-                            "引擎运行中已超过 ${timeout / 1000} 秒没有任何任务触发（idle 看门狗）。" +
-                                    "请 describe_screen 或 get_screenshot 查看当前画面，判断是流程卡住、被踢下线还是任务已失效"
-                        )
-                    )
-                }
-            }.onFailure { Log.w(TAG, "idle watch error", it) }
-        }
-    }
-
-    private fun scheduleStallWatch(e: TaskFinished) {
-        val rule = AiStores.loadRules().firstOrNull { it.type == "stall" && it.taskId == e.taskId } ?: return
-        stallJobs.remove(e.taskId)?.cancel()
-        stallJobs[e.taskId] = scope.launch {
-            delay(rule.timeoutMs)
-            stallJobs.remove(e.taskId)
-            if (MonitoringEngine.isMonitoring) {
-                enqueue(
-                    WakeEvent(
-                        "stall",
-                        "任务「${e.name}」执行完后已 ${rule.timeoutMs / 1000} 秒没有任何其他任务接续触发（stall 看门狗）。" +
-                                "请检查后续流程是否卡住"
-                    ),
-                )
-            }
-        }
-    }
-
-    private fun handleDebugRounds(e: TaskFinished) {
-        if (!e.debugMode || !e.completed) return
-        val rounds = (debugRounds[e.taskId] ?: 0) + 1
-        debugRounds[e.taskId] = rounds
-        val need = AiStores.loadSettings().debugRounds.coerceAtLeast(1)
-        if (rounds >= need) {
-            debugRounds.remove(e.taskId)
-            enqueue(
-                WakeEvent(
-                    "debug_review",
-                    "debug 任务「${e.name}」已跑满 $need 轮。请 get_debug_captures(taskId=${e.taskId}) " +
-                            "复盘每步截图，确认无误后 set_task_mode 转 normal；有问题则 upsert_task 修改后继续试跑"
-                )
-            )
-        }
-    }
-
-    private fun enqueue(ev: WakeEvent) {
-        val settings = AiStores.loadSettings()
-        if (!settings.enabled || settings.baseUrl.isBlank() || settings.model.isBlank()) {
-            Log.i(TAG, "AI 未启用，忽略事件: ${ev.type}")
-            return
-        }
-        Log.i(TAG, "wake event: ${ev.type} ${ev.taskId ?: ""}")
+        MonitoringEngine.eventListener = ::onEngineEvent
         scope.launch {
-            pending.send(ev)
-            mutex.withLock {
-                // drain：把排队事件逐个跑掉
+            for (ignored in signal) {
                 while (true) {
-                    val ev2 = pending.tryReceive().getOrNull() ?: break
-                    runCatching { AiSession.run(ev2.type, ev2.detail, AiStores.loadSettings()) }
-                        .onSuccess { AiStores.appendLog(it) }
-                        .onFailure {
-                            Log.w(TAG, "ai session failed", it)
-                            AiStores.appendLog(
-                                AiLogEntry(
-                                    System.currentTimeMillis(), ev2.type, ev2.detail, 0,
-                                    "会话失败：${it.message ?: it.javaClass.simpleName}"
-                                )
-                            )
+                    val ev = pending.poll() ?: break
+                    try {
+                        val job = synchronized(guard) {
+                            if (!allowed(ev.epoch) || SystemClock.elapsedRealtime() - ev.createdAt > 120000) null
+                            else scope.launch(start = CoroutineStart.LAZY) {
+                                try {
+                                    status = "等待屏幕控制权"
+                                    val result = ScreenControl.withOwner("ai") {
+                                        checkAllowed(ev.epoch)
+                                        status = "处理 ${ev.type}"
+                                        withTimeout(300000) {
+                                            AiSession.run(ev.type, ev.detail, AiStores.loadSettings(), ev.taskId) { checkAllowed(ev.epoch) }
+                                        }
+                                    }
+                                    AiStores.appendLog(result)
+                                } catch (e: CancellationException) {
+                                    Log.i("WakeDispatcher", "session cancelled")
+                                    throw e
+                                } catch (e: Exception) {
+                                    AiStores.appendLog(AiLogEntry(System.currentTimeMillis(), ev.type, ev.detail.take(200), 0,
+                                        "会话失败，未重放工具：${e.message}"))
+                                } finally { status = "空闲" }
+                            }.also { active = it; it.start() }
                         }
+                        job?.join()
+                    } finally { pending.finish(ev) }
                 }
             }
+        }
+        scope.launch { watchLoop() }
+    }
+
+    private fun allowed(token: Long): Boolean = token == epoch && !suspendedByUser && AiStores.loadSettings().enabled
+    fun checkAllowed(token: Long) { if (!allowed(token)) throw CancellationException("AI 已停用或本轮已取消") }
+
+    fun cancelAi() = synchronized(guard) {
+        suspendedByUser = true
+        epoch++
+        pending.clear()
+        active?.cancel()
+        active = null
+        stalls.clear()
+        rounds.clear()
+        status = "已停止"
+    }
+
+    fun stopAll() {
+        cancelAi()
+        MonitoringEngine.stop()
+        ScreenControl.cancelActive()
+    }
+
+    fun onSettingsChanged() {
+        if (!AiStores.loadSettings().enabled) cancelAi() else resumeAutomation()
+    }
+
+    fun resumeAutomation() = synchronized(guard) {
+        suspendedByUser = false
+        lastActivity = SystemClock.elapsedRealtime()
+        taskActivity.clear()
+    }
+
+    fun manual(text: String): Boolean {
+        resumeAutomation()
+        return enqueue("manual", "用户指令：$text")
+    }
+
+    fun onRecordingFinished(stepCount: Int) {
+        enqueue("recording_finished", "完成 $stepCount 步录制。请 get_last_recording，补触发条件与 wait_text 结果验证后保存 debug 任务")
+    }
+
+    fun onEngineEvent(e: EngineEvent) {
+        val now = SystemClock.elapsedRealtime()
+        synchronized(guard) {
+            when (e) {
+                is EngineEvent.TaskFired -> {
+                    lastActivity = now
+                    taskActivity[e.taskId] = now
+                    stalls.fired(e.taskId)
+                }
+                is EngineEvent.TaskFinished -> {
+                    lastActivity = now
+                    taskActivity[e.taskId] = now
+                    if (e.result.reason == "已取消") return
+                    if (e.manual || !e.completed) {
+                        if (e.debugMode || !e.completed) MonitoringEngine.holdForReview(e.taskId)
+                        enqueue(if (e.manual) "test_run_finished" else "task_failed",
+                            "任务「${e.name}」执行 ${e.stepsRan} 步，完成=${e.completed}，结果验证=${e.result.verified}，原因=${e.result.reason}。请 get_run_result 和 get_debug_captures 复核", e.taskId)
+                        return
+                    }
+                    AiStores.loadRules().firstOrNull { it.type == "stall" && it.taskId == e.taskId }?.let {
+                        stalls.finished(e.taskId, now + it.timeoutMs.coerceIn(10000, 3600000))
+                    }
+                    if (e.debugMode) {
+                        val prev = rounds[e.taskId]
+                        val count = if (prev?.first == e.result.revision) prev.second + 1 else 1
+                        rounds[e.taskId] = e.result.revision to count
+                        if (count >= AiStores.loadSettings().debugRounds.coerceIn(1, 10)) {
+                            MonitoringEngine.holdForReview(e.taskId)
+                            rounds.remove(e.taskId)
+                            enqueue("debug_review", "任务「${e.name}」已跑满 $count 轮，暂停自动重复，等待复盘。请读取执行结果和前后截图；必须有末步 wait_text 验证才可转正", e.taskId)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun enqueue(type: String, detail: String, taskId: Long? = null): Boolean = synchronized(guard) {
+        val s = AiStores.loadSettings()
+        if (!s.enabled || s.baseUrl.isBlank() || s.model.isBlank() || suspendedByUser) return@synchronized false
+        val ok = pending.offer(WakeEvent(type, detail, taskId, epoch = epoch))
+        if (ok) signal.trySend(Unit) else Log.i("WakeDispatcher", "coalesced/full: $type/$taskId")
+        ok
+    }
+
+    private suspend fun watchLoop() {
+        var wasRunning = false
+        while (true) {
+            delay(1000)
+            try {
+                synchronized(guard) {
+                    val now = SystemClock.elapsedRealtime()
+                    val running = MonitoringEngine.isMonitoring
+                    if (!running || !wasRunning) {
+                        lastActivity = now; taskActivity.clear(); stalls.clear()
+                    }
+                    wasRunning = running
+                    if (!running || !allowed(epoch)) return@synchronized
+                    val enabled = MonitoringEngine.tasksSnapshot().filter { it.enabled }
+                    if (ScreenControl.owner in setOf("ai", "recording", "preview")) {
+                        lastActivity = now; taskActivity.clear(); stalls.clear()
+                        return@synchronized
+                    }
+                    if (MonitoringEngine.currentTaskName != null) return@synchronized
+                    for (rule in AiStores.loadRules().filter { it.type == "idle" }) {
+                        if (enabled.none { rule.taskId == null || it.id == rule.taskId }) continue
+                        val last = rule.taskId?.let { taskActivity[it] } ?: lastActivity
+                        if (now - last >= rule.timeoutMs.coerceIn(10000, 3600000)) {
+                            enqueue("idle", "指定范围超过 ${rule.timeoutMs / 1000} 秒无活动，请检查画面", rule.taskId)
+                            if (rule.taskId == null) lastActivity = now else taskActivity[rule.taskId] = now
+                        }
+                    }
+                    stalls.due(now).filter { id -> enabled.any { it.id == id } }.forEach { id ->
+                        enqueue("stall", "任务#$id 执行后没有其他任务接续；同任务重复不算接续", id)
+                    }
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { Log.w("WakeDispatcher", "watch failed", e) }
         }
     }
 }

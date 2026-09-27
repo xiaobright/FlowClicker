@@ -18,12 +18,16 @@ class FlowClickerApp : Application() {
         AiStores.init(this)
         DebugStore.init(this)
 
-        MonitoringEngine.setTasks(TaskStore.loadAll())
+        runCatching { MonitoringEngine.setTasks(TaskStore.loadAll()) }
+            .onFailure { MonitoringEngine.loadError = it.message ?: "任务文件损坏" }
         MonitoringEngine.frameProvider = {
             ScreenCaptureService.instance?.currentFrame()
         }
         MonitoringEngine.textRecognizer = { frame, region ->
             OcrRecognizer.recognize(frame, region)
+        }
+        MonitoringEngine.textLocator = { frame, region ->
+            OcrRecognizer.recognizeBoxes(frame, region)
         }
         MonitoringEngine.onChanged = { tasks ->
             TaskStore.saveAll(tasks)

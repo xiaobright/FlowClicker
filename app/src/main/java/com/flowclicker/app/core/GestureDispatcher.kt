@@ -7,6 +7,11 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 /**
  * 全局手势派发器。
@@ -42,15 +47,24 @@ object GestureDispatcher {
 
     /** 按采样点序列派发手势（单点=点击），录制转发与复杂轨迹共用 */
     suspend fun strokePath(points: List<Pair<Float, Float>>, durationMs: Long): Boolean {
-        val svc = service ?: return false
         if (points.isEmpty()) return false
         return mutex.withLock {
+            currentCoroutineContext().ensureActive()
+            val svc = service ?: return@withLock false
+            require(durationMs in 1..5000) { "手势时长必须为 1..5000ms" }
+            val metrics = svc.resources.displayMetrics
+            require(points.all { (x, y) ->
+                x.isFinite() && y.isFinite() && x >= 0 && y >= 0 &&
+                    x < metrics.widthPixels && y < metrics.heightPixels
+            }) { "手势坐标超出屏幕" }
             val path = Path().apply {
                 points.forEachIndexed { i, p ->
                     if (i == 0) moveTo(p.first, p.second) else lineTo(p.first, p.second)
                 }
             }
-            suspendCancellableCoroutine { cont ->
+            // An admitted system gesture cannot be recalled. Keep ownership until its callback,
+            // even when the caller stops, so the next owner cannot overlap it.
+            withContext(NonCancellable) { withTimeout(durationMs + 2000) { suspendCancellableCoroutine { cont ->
                 val dispatched = svc.dispatchGesture(
                     GestureDescription.Builder()
                         .addStroke(
@@ -71,7 +85,7 @@ object GestureDispatcher {
                     null
                 )
                 if (!dispatched && cont.isActive) cont.resume(false)
-            }
+            } } }
         }
     }
 }

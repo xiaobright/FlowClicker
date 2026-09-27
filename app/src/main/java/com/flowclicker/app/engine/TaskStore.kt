@@ -5,6 +5,7 @@ import android.util.Log
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import com.flowclicker.app.core.AtomicTextFile
 
 /**
  * 任务持久化：JSON 存于应用私有目录。
@@ -29,17 +30,13 @@ object TaskStore {
         }
     }
 
-    fun loadAll(): MutableList<Task> {
+    @Synchronized fun loadAll(): MutableList<Task> {
         if (!file.exists()) return mutableListOf()
-        return runCatching { json.decodeFromString<List<Task>>(file.readText()) }
-            .onFailure { Log.w(TAG, "tasks.json decode failed, starting empty", it) }
-            .getOrDefault(emptyList())
-            .toMutableList()
+        return json.decodeFromString<List<Task>>(AtomicTextFile.read(file)).toMutableList()
     }
 
-    fun saveAll(tasks: List<Task>) {
-        runCatching { file.writeText(json.encodeToString<List<Task>>(tasks)) }
-            .onFailure { Log.w(TAG, "tasks.json save failed", it) }
+    @Synchronized fun saveAll(tasks: List<Task>) {
+        AtomicTextFile.write(file, json.encodeToString<List<Task>>(tasks))
     }
 
     fun nextId(tasks: List<Task>): Long = (tasks.maxOfOrNull { it.id } ?: 0L) + 1L

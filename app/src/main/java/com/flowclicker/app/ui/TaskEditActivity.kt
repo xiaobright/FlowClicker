@@ -182,6 +182,9 @@ class TaskEditActivity : AppCompatActivity() {
             is Step.Click -> clickDialog(index)
             is Step.Swipe -> swipeDialog(index)
             is Step.Wait -> waitDialog(index)
+            is Step.WaitText -> Toast.makeText(
+                this, "等待文字步骤暂不支持界面编辑（可由 AI 调整或删除后重加）", Toast.LENGTH_SHORT
+            ).show()
             is Step.EnableTagged -> tagDialog(true, index)
             is Step.DisableTagged -> tagDialog(false, index)
         }
@@ -224,6 +227,11 @@ class TaskEditActivity : AppCompatActivity() {
         val c = dialogContainer()
         val eX = field(c, "X (px)", s?.x?.str() ?: "")
         val eY = field(c, "Y (px)", s?.y?.str() ?: "")
+        val eAnchor = field(
+            c,
+            "OCR 锚点文字（可选，执行时按屏幕文字实时定位，未命中回退坐标）",
+            s?.anchor ?: ""
+        )
         val eOff = field(c, "随机偏移 ±px", s?.maxOffsetPx?.str() ?: "8")
         val ePress = field(c, "按压时长 ms", s?.pressMs?.toString() ?: "60")
         val ePressJ = field(c, "按压时长抖动 ±ms", s?.pressJitterMs?.toString() ?: "20")
@@ -240,6 +248,7 @@ class TaskEditActivity : AppCompatActivity() {
                 val step = Step.Click(
                     x = eX.str().toFloatOrNull() ?: 0f,
                     y = eY.str().toFloatOrNull() ?: 0f,
+                    anchor = eAnchor.str().trim().ifEmpty { null },
                     maxOffsetPx = eOff.str().toFloatOrNull() ?: 0f,
                     pressMs = ePress.str().toLongOrNull() ?: 60L,
                     pressJitterMs = ePressJ.str().toLongOrNull() ?: 0L,
@@ -352,6 +361,7 @@ class TaskEditActivity : AppCompatActivity() {
     private fun describe(s: Step): String = when (s) {
         is Step.Click -> buildString {
             append("点击(${s.x.toInt()},${s.y.toInt()})")
+            if (!s.anchor.isNullOrBlank()) append(" 锚「${s.anchor}」")
             if (s.maxOffsetPx > 0) append(" 偏移±${s.maxOffsetPx.toInt()}")
             append(" 压${s.pressMs}±${s.pressJitterMs}ms 延${s.delayAfterMs}±${s.delayJitterMs}ms")
         }
@@ -360,6 +370,8 @@ class TaskEditActivity : AppCompatActivity() {
                 " ${s.durationMs}±${s.durationJitterMs}ms 延${s.delayAfterMs}±${s.delayJitterMs}ms"
 
         is Step.Wait -> "等待 ${s.ms}ms"
+        is Step.WaitText ->
+            "等待「${s.text}」${if (s.present) "出现" else "消失"} · 超时${s.timeoutMs}ms"
         is Step.EnableTagged -> "启用标签组「${s.tag}」"
         is Step.DisableTagged -> "停用标签组「${s.tag}」"
     }

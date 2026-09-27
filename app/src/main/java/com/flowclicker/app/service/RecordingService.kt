@@ -25,6 +25,11 @@ import com.flowclicker.app.R
 import com.flowclicker.app.ai.WakeDispatcher
 import com.flowclicker.app.core.GestureDispatcher
 import com.flowclicker.app.engine.Step
+import com.flowclicker.app.engine.RecordingTiming
+import com.flowclicker.app.core.ScreenControl
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.CancellationException
+import android.widget.Toast
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -64,6 +69,7 @@ class RecordingService : Service() {
 
     /** 待转发的手势数：>0 时拦截层保持不可触摸，全部完成后恢复 */
     private var pendingForwards = 0
+    private var starting = false
 
     // 录制中的手势状态（主线程访问）
     private var downT = 0L
@@ -77,7 +83,7 @@ class RecordingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (overlayRoot == null) startNow()
+        if (!starting) { starting = true; startNow() }
         return START_NOT_STICKY
     }
 
@@ -91,8 +97,17 @@ class RecordingService : Service() {
         } else {
             startForeground(NOTIF_ID, buildNotification())
         }
-        buildOverlay()
-        Log.i(TAG, "recording overlay shown")
+        scope.launch {
+            try {
+                ScreenControl.withOwner("recording") {
+                    check(GestureDispatcher.isReady) { "先开启无障碍服务" }
+                    buildOverlay()
+                    awaitCancellation()
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { Toast.makeText(this@RecordingService, e.message, Toast.LENGTH_LONG).show() }
+            finally { stopSelf() }
+        }
     }
 
     private fun buildOverlay() {
@@ -194,7 +209,7 @@ class RecordingService : Service() {
                     return true
                 }
                 samples.add((e.x + touchOffset[0]) to (e.y + touchOffset[1]))
-                val dur = (now - downT).coerceIn(40, 60000)
+                val dur = (now - downT).coerceIn(40, 5000)
                 val isTap = maxDist < 14f
                 records.add(GestureRecord(downT, now, isTap, samples.toList()))
                 tvTitle?.text = "录制中 · ${records.size} 步"
@@ -216,14 +231,17 @@ class RecordingService : Service() {
                 delay(80)
                 if (isTap) {
                     val (x, y) = rec.points.first()
-                    GestureDispatcher.tap(x, y, dur.coerceIn(40, 1500))
+                    check(GestureDispatcher.tap(x, y, dur)) { "转发点击失败" }
                 } else {
-                    GestureDispatcher.strokePath(rec.points, dur.coerceIn(80, 60000))
+                    check(GestureDispatcher.strokePath(rec.points, dur.coerceIn(80, 5000))) { "转发滑动失败" }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.w(TAG, "forward failed", e)
+                records.remove(rec)
+                tvTitle?.text = "转发失败 · ${records.size} 步"
             } finally {
-                delay(40)
                 pendingForwards--
                 if (pendingForwards <= 0) {
                     pendingForwards = 0
@@ -247,10 +265,9 @@ class RecordingService : Service() {
     private fun finishRecording() {
         Log.i(TAG, "finish requested, recorded=${records.size}")
         val steps = mutableListOf<Step>()
-        var prevEnd = -1L
-        for (r in records) {
-            val gap = if (prevEnd < 0) 500L else (r.downT - prevEnd).coerceIn(80, 15000)
-            prevEnd = r.upT
+        val times = records.map { it.downT to it.upT }
+        for ((index, r) in records.withIndex()) {
+            val gap = RecordingTiming.delayAfter(times, index)
             val dur = r.upT - r.downT
             val first = r.points.first()
             val last = r.points.last()
@@ -259,15 +276,15 @@ class RecordingService : Service() {
                     Step.Click(
                         x = first.first, y = first.second,
                         maxOffsetPx = 4f,
-                        pressMs = dur.coerceIn(40, 1200), pressJitterMs = 15,
-                        delayAfterMs = gap, delayJitterMs = 200,
+                        pressMs = dur.coerceIn(40, 5000), pressJitterMs = 0,
+                        delayAfterMs = gap, delayJitterMs = 0,
                     )
                 } else {
                     Step.Swipe(
                         x1 = first.first, y1 = first.second,
                         x2 = last.first, y2 = last.second,
-                        durationMs = dur.coerceIn(80, 60000), durationJitterMs = 60,
-                        delayAfterMs = gap, delayJitterMs = 200,
+                        durationMs = dur.coerceIn(80, 5000), durationJitterMs = 0,
+                        delayAfterMs = gap, delayJitterMs = 0,
                     )
                 }
             )

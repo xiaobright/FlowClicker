@@ -13,6 +13,12 @@ import kotlinx.serialization.json.put
 import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import kotlinx.coroutines.*
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * OpenAI 兼容 chat/completions 客户端（HttpURLConnection，零额外依赖）。
@@ -69,7 +75,39 @@ class AiClient(private val settings: AiSettings) {
         }
 
     /** 阻塞调用，返回首个 choice 的文本内容（多模态返回时拼接 text 部件） */
-    suspend fun chat(messages: List<JsonObject>): String = withContext(Dispatchers.IO) {
+    suspend fun chat(messages: List<JsonObject>): String {
+        // Retry this request only. The caller retains every already completed tool result.
+        repeat(3) { attempt ->
+            currentCoroutineContext().ensureActive()
+            try { return request(messages) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (attempt == 2 || !RetryPolicy.retryable(e)) throw e
+                delay(if (attempt == 0) 5000 else 15000)
+            }
+        }
+        error("unreachable")
+    }
+
+    private suspend fun request(messages: List<JsonObject>): String = suspendCancellableCoroutine { continuation ->
+        val connection = AtomicReference<HttpURLConnection?>()
+        val worker = CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val response = blockingRequest(messages, connection) { continuation.isActive }
+                if (continuation.isActive) continuation.resume(response)
+            } catch (e: Exception) {
+                if (continuation.isActive) continuation.resumeWithException(e)
+            }
+        }
+        continuation.invokeOnCancellation {
+            connection.get()?.disconnect()
+            worker.cancel()
+        }
+    }
+
+    private fun blockingRequest(
+        messages: List<JsonObject>, reference: AtomicReference<HttpURLConnection?>, active: () -> Boolean
+    ): String {
         val body = buildJsonObject {
             put("model", settings.model)
             put("temperature", 0.3)
@@ -87,15 +125,17 @@ class AiClient(private val settings: AiSettings) {
                 setRequestProperty("Authorization", "Bearer ${settings.apiKey}")
             }
         }
+        reference.set(conn)
         try {
+            if (!active()) throw CancellationException("请求已取消")
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val text = stream?.bufferedReader()?.readText() ?: ""
             if (code !in 200..299) {
-                throw IllegalStateException("HTTP $code: ${text.take(400)}")
+                throw AiHttpException(code, "HTTP $code: ${text.take(400)}")
             }
-            parseContent(text)
+            return parseContent(text)
         } finally {
             conn.disconnect()
         }
@@ -109,7 +149,7 @@ class AiClient(private val settings: AiSettings) {
             ?: throw IllegalStateException("响应缺 message")
         return when (val content = message["content"]) {
             is kotlinx.serialization.json.JsonPrimitive -> content.content
-            is JsonArray -> content.toString()
+            is JsonArray -> content.mapNotNull { (it as? JsonObject)?.get("text")?.jsonPrimitive?.content }.joinToString("\n")
             else -> content?.toString() ?: ""
         }
     }

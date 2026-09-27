@@ -23,6 +23,9 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.IntentCompat
 import com.flowclicker.app.R
+import com.flowclicker.app.ai.WakeDispatcher
+import android.content.res.Configuration
+import android.os.SystemClock
 
 /**
  * 屏幕采集前台服务：一个 MediaProjection 会话产出共享帧，
@@ -38,6 +41,9 @@ class ScreenCaptureService : Service() {
     @Volatile
     private var latestFrame: Bitmap? = null
     private val frameLock = Any()
+    @Volatile private var acceptingFrames = false
+    @Volatile var frameTime: Long = 0
+        private set
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -58,6 +64,7 @@ class ScreenCaptureService : Service() {
         val resultData = intent?.let {
             IntentCompat.getParcelableExtra(it, EXTRA_RESULT_DATA, Intent::class.java)
         }
+        if (isRunning) return START_NOT_STICKY
         if (resultData == null) {
             Log.w(TAG, "missing projection result data, stopping")
             stopSelf()
@@ -87,13 +94,17 @@ class ScreenCaptureService : Service() {
         captureThread = HandlerThread("frame-capture").also { it.start() }
         val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
         imageReader = reader
+        acceptingFrames = true
         reader.setOnImageAvailableListener({ r ->
             val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
                 val bmp = imageToBitmap(image)
                 synchronized(frameLock) {
-                    latestFrame?.recycle()
-                    latestFrame = bmp
+                    if (acceptingFrames) {
+                        latestFrame?.recycle()
+                        latestFrame = bmp
+                        frameTime = SystemClock.elapsedRealtime()
+                    } else bmp.recycle()
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "frame conversion failed", e)
@@ -115,6 +126,8 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
+        acceptingFrames = false
+        WakeDispatcher.stopAll()
         isRunning = false
         instance = null
         virtualDisplay?.release()
@@ -133,7 +146,13 @@ class ScreenCaptureService : Service() {
         super.onDestroy()
     }
 
-    /** 返回当前帧的拷贝；原帧由采集线程在下一帧到达时回收，消费方无需管理生命周期 */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        WakeDispatcher.stopAll()
+        stopSelf()
+    }
+
+    /** 返回独立拷贝，消费方必须 recycle。 */
     fun currentFrame(): Bitmap? = synchronized(frameLock) {
         latestFrame?.takeIf { !it.isRecycled }?.copy(Bitmap.Config.ARGB_8888, false)
     }
@@ -151,7 +170,8 @@ class ScreenCaptureService : Service() {
                 image.height,
                 Bitmap.Config.ARGB_8888
             ).apply { copyPixelsFromBuffer(plane.buffer) }
-            Bitmap.createBitmap(padded, 0, 0, image.width, image.height)
+            try { Bitmap.createBitmap(padded, 0, 0, image.width, image.height) }
+            finally { padded.recycle() }
         }
     }
 
@@ -167,6 +187,10 @@ class ScreenCaptureService : Service() {
             .setSmallIcon(R.drawable.ic_stat_notify)
             .setContentTitle("屏幕采集中")
             .setContentText("流程点击器正在监测屏幕内容")
+            .addAction(0, "停止全部操作", android.app.PendingIntent.getBroadcast(
+                this, 0, Intent(this, StopAutomationReceiver::class.java),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            ))
             .setOngoing(true)
             .build()
 

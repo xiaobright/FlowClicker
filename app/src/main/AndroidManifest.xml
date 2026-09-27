@@ -43,6 +43,8 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection" />
 
+        <receiver android:name=".service.StopAutomationReceiver" android:exported="false" />
+
         <activity
             android:name=".ui.TaskListActivity"
             android:exported="false" />
