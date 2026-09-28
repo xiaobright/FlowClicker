@@ -11,11 +11,13 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.random.Random
 
 sealed interface EngineEvent {
-    data class TaskFired(val taskId: Long, val name: String) : EngineEvent
+    val generation: Long
+    data class TaskFired(val taskId: Long, val name: String, override val generation: Long) : EngineEvent
     data class TaskFinished(
         val taskId: Long, val name: String, val stepsRan: Int,
         val completed: Boolean, val manual: Boolean, val debugMode: Boolean,
         val result: RunResult,
+        override val generation: Long,
     ) : EngineEvent
 }
 
@@ -26,13 +28,30 @@ data class RunResult(
     val reason: String? = null,
 )
 
+internal class FrameGapWatch(private val maxGapMs: Long = 5000) {
+    private var missingSince: Long? = null
+
+    fun expired(hasFrame: Boolean, now: Long): Boolean {
+        if (hasFrame) {
+            missingSince = null
+            return false
+        }
+        val since = missingSince
+        if (since == null) {
+            missingSince = now
+            return false
+        }
+        return now - since >= maxGapMs
+    }
+}
+
 /** One serialized state writer and one cancellable local runner. */
 object MonitoringEngine {
     private val stateLock = Any()
     private val lifecycleLock = Any()
     private var tasks: List<Task> = emptyList()
     private var scope: CoroutineScope? = null
-    private var generation = 0L
+    @Volatile private var generation = 0L
     private val manualFire = AtomicReference<Long?>(null)
     private val reviewPending = mutableSetOf<Long>()
     private val results = mutableMapOf<Long, RunResult>()
@@ -54,6 +73,7 @@ object MonitoringEngine {
     fun tasksSnapshot(): List<Task> = synchronized(stateLock) { tasks.toList() }
     fun lastResult(id: Long): RunResult? = synchronized(stateLock) { results[id] }
     fun pendingReviews(): List<Long> = synchronized(stateLock) { reviewPending.toList() }
+    fun isCurrentGeneration(token: Long): Boolean = generation == token
     fun holdForReview(id: Long) = synchronized(stateLock) { reviewPending.add(id); Unit }
 
     fun updateTasks(transform: (MutableList<Task>) -> Unit) = synchronized(stateLock) {
@@ -105,12 +125,17 @@ object MonitoringEngine {
         val token = ++generation
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Default).also { s ->
             s.launch {
+                val frameGap = FrameGapWatch()
                 try {
                     while (currentCoroutineContext().isActive) {
                         ScreenControl.withOwner("engine") {
                             val id = manualFire.getAndSet(null)
-                            if (id != null) tasksSnapshot().firstOrNull { it.id == id }?.let { runTask(it, true) }
-                            else evaluateOnce()
+                            if (id != null) {
+                                frameGap.expired(true, SystemClock.elapsedRealtime())
+                                tasksSnapshot().firstOrNull { it.id == id }?.let { runTask(it, true) }
+                            } else if (frameGap.expired(evaluateOnce(), SystemClock.elapsedRealtime())) {
+                                error("连续 5 秒未获取到屏幕画面，监测已停止；请检查采集权限")
+                            }
                         }
                         delay(500)
                     }
@@ -142,12 +167,12 @@ object MonitoringEngine {
         runTask(task, manual = true, transient = true)
     }
 
-    private suspend fun evaluateOnce() {
+    private suspend fun evaluateOnce(): Boolean {
         val active = synchronized(stateLock) {
             tasks.filter { it.enabled && it.id !in reviewPending }.sortedBy { it.priority }
         }
-        if (active.isEmpty()) return
-        val frame = frameProvider?.invoke() ?: error("屏幕采集已停止")
+        if (active.isEmpty()) return true
+        val frame = frameProvider?.invoke() ?: return false
         try {
             val cache = mutableMapOf<Region?, String?>()
             for (task in active) {
@@ -157,19 +182,21 @@ object MonitoringEngine {
                 if (text != null && task.trigger.keywords.any { it.isNotBlank() && text.contains(it, task.trigger.ignoreCase) }) {
                     val latest = tasksSnapshot().firstOrNull { it.id == task.id }
                     if (latest?.enabled == true && latest.revision == task.revision) runTask(task, false)
-                    return
+                    return true
                 }
             }
         } finally { frame.recycle() }
+        return true
     }
 
     private suspend fun runTask(task: Task, manual: Boolean, transient: Boolean = false): RunResult {
+        val runGeneration = generation
         var ran = 0
         var completed = false
         var reason: String? = null
         val runId = "${System.currentTimeMillis()}-${task.id}"
         currentTaskName = task.name
-        if (!transient) emit(EngineEvent.TaskFired(task.id, task.name))
+        if (!transient) emit(EngineEvent.TaskFired(task.id, task.name, runGeneration))
         try {
             TaskValidation.validate(task)
             for ((index, step) in task.steps.withIndex()) {
@@ -190,6 +217,7 @@ object MonitoringEngine {
                 val i = list.indexOfFirst { it.id == task.id }
                 if (i >= 0) list[i] = list[i].copy(enabled = false)
             }
+            currentCoroutineContext().ensureActive()
             completed = true
         } catch (e: CancellationException) {
             reason = "已取消"
@@ -207,8 +235,8 @@ object MonitoringEngine {
                     results[task.id] = result
                     if (!completed) reviewPending.add(task.id)
                 }
-                emit(EngineEvent.TaskFinished(task.id, task.name, ran, completed, manual,
-                    task.mode == Task.MODE_DEBUG, result))
+                if (generation == runGeneration) emit(EngineEvent.TaskFinished(task.id, task.name, ran, completed, manual,
+                    task.mode == Task.MODE_DEBUG, result, runGeneration))
             }
         }
         return RunResult(task.id, task.revision, runId, ran, completed,
@@ -228,24 +256,20 @@ object MonitoringEngine {
                     y + Random.nextFloat() * step.maxOffsetPx * 2 - step.maxOffsetPx,
                     jitter(step.pressMs, step.pressJitterMs).coerceAtLeast(1)
                 )) { "点击未派发或被取消" }
+                currentCoroutineContext().ensureActive()
                 delay(jitter(step.delayAfterMs, step.delayJitterMs).coerceAtLeast(0))
             }
             is Step.Swipe -> {
                 check(GestureDispatcher.swipe(step.x1, step.y1, step.x2, step.y2,
                     jitter(step.durationMs, step.durationJitterMs).coerceAtLeast(1))) { "滑动未派发或被取消" }
+                currentCoroutineContext().ensureActive()
                 delay(jitter(step.delayAfterMs, step.delayJitterMs).coerceAtLeast(0))
             }
             is Step.Wait -> delay(step.ms)
-            is Step.WaitText -> {
-                val deadline = SystemClock.elapsedRealtime() + step.timeoutMs
-                while (true) {
-                    currentCoroutineContext().ensureActive()
-                    val frame = frameProvider?.invoke() ?: error("验证时屏幕采集不可用")
-                    val text = try { textRecognizer?.invoke(frame, step.region) } finally { frame.recycle() }
-                    if (text != null && text.contains(step.text, true) == step.present) break
-                    check(SystemClock.elapsedRealtime() < deadline) { "等待文字${if (step.present) "出现" else "消失"}超时：${step.text}" }
-                    delay(300)
-                }
+            is Step.WaitText -> waitForText(step) {
+                val frame = frameProvider?.invoke()
+                if (frame == null) null
+                else try { textRecognizer?.invoke(frame, step.region) } finally { frame.recycle() }
             }
             is Step.EnableTagged -> setTag(step.tag, true)
             is Step.DisableTagged -> setTag(step.tag, false)

@@ -224,7 +224,7 @@ object AiSession {
         else -> ""
     }
 
-    private fun systemPrompt(settings: AiSettings): String = buildString {
+    internal fun systemPrompt(settings: AiSettings): String = buildString {
         appendLine("你是安卓自动挂机应用「流程点击器」内部的 AI 编排调度员。")
         appendLine("用户以模块化任务挂机：引擎循环截屏→OCR识字→关键词命中→执行动作序列；")
         appendLine("多个任务并行监测、互斥执行。你负责：编排任务、设置兜底唤醒规则、看图诊断、试运行验收。")

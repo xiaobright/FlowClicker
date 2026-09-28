@@ -86,7 +86,7 @@ object AiStores {
         if (!sessionsDir.exists()) sessionsDir.mkdirs()
     }
 
-    private inline fun <reified T> read(file: File, default: T): T {
+    private inline fun <reified T> read(file: File, default: T): T = synchronized(this) {
         if (!file.exists()) return default
         return runCatching { json.decodeFromString<T>(AtomicTextFile.read(file)) }
             .onFailure { Log.w(TAG, "decode failed: ${file.name}", it) }
@@ -123,7 +123,7 @@ object AiStores {
         write(taskNotesFile, loadTaskNotes().filter { it.taskId != note.taskId } + note)
     }
 
-    fun loadSession(taskId: Long): SessionRecord? = runCatching {
+    @Synchronized fun loadSession(taskId: Long): SessionRecord? = runCatching {
         val f = File(sessionsDir, "task_$taskId.json")
         if (!f.exists()) null else json.decodeFromString<SessionRecord>(AtomicTextFile.read(f))
     }.onFailure { Log.w(TAG, "decode session failed: task_$taskId", it) }.getOrNull()
@@ -134,7 +134,7 @@ object AiStores {
         }.onFailure { Log.w(TAG, "save session failed: task_${record.taskId}", it) }
     }
 
-    fun deleteSession(taskId: Long) {
+    @Synchronized fun deleteSession(taskId: Long) {
         runCatching { File(sessionsDir, "task_$taskId.json").delete() }
     }
 

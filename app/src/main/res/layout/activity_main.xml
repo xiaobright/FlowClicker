@@ -54,6 +54,12 @@
             android:text="@string/btn_capture_stop" />
 
         <Button
+            android:id="@+id/btnEmergencyStop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="停止全部自动操作（含 AI / 录制）" />
+
+        <Button
             android:id="@+id/btnTest"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

@@ -8,6 +8,8 @@ import com.flowclicker.app.engine.MonitoringEngine
 import com.flowclicker.app.engine.OcrRecognizer
 import com.flowclicker.app.engine.TaskStore
 import com.flowclicker.app.service.ScreenCaptureService
+import com.flowclicker.app.core.GestureDispatcher
+import com.flowclicker.app.core.ScreenControl
 
 /** 启动时初始化各存储，并把识别器、共享帧、debug 截图、事件监听接入引擎 */
 class FlowClickerApp : Application() {
@@ -23,6 +25,14 @@ class FlowClickerApp : Application() {
         MonitoringEngine.frameProvider = {
             ScreenCaptureService.instance?.currentFrame()
         }
+        GestureDispatcher.beforeGesture = {
+            // Recording forwards the user's own touch and need not have a projection.
+            if (ScreenControl.owner != "recording") {
+                val capture = ScreenCaptureService.instance ?: error("请先开启屏幕采集")
+                capture.awaitActionFrame()
+            }
+        }
+        GestureDispatcher.afterGesture = { ScreenCaptureService.instance?.invalidateFrame() }
         MonitoringEngine.textRecognizer = { frame, region ->
             OcrRecognizer.recognize(frame, region)
         }

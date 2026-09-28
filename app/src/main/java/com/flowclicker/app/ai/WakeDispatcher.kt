@@ -19,8 +19,8 @@ object WakeDispatcher {
     private val signal = Channel<Unit>(Channel.CONFLATED)
     private val pending = WakeQueue<WakeEvent>(5) { "${it.epoch}:${it.type}:${it.taskId}:${if (it.type == "manual") it.detail else ""}" }
     private var active: Job? = null
-    @Volatile private var epoch = 0L
-    @Volatile private var suspendedByUser = false
+    private val gate = AutomationGate()
+    private val epoch get() = gate.epoch
     @Volatile var status = "空闲"
         private set
     private var lastActivity = SystemClock.elapsedRealtime()
@@ -42,6 +42,7 @@ object WakeDispatcher {
                                     status = "等待屏幕控制权"
                                     val result = ScreenControl.withOwner("ai") {
                                         checkAllowed(ev.epoch)
+                                        if (SystemClock.elapsedRealtime() - ev.createdAt > 120000) throw CancellationException("事件已过期")
                                         status = "处理 ${ev.type}"
                                         withTimeout(300000) {
                                             AiSession.run(ev.type, ev.detail, AiStores.loadSettings(), ev.taskId) { checkAllowed(ev.epoch) }
@@ -65,12 +66,11 @@ object WakeDispatcher {
         scope.launch { watchLoop() }
     }
 
-    private fun allowed(token: Long): Boolean = token == epoch && !suspendedByUser && AiStores.loadSettings().enabled
+    private fun allowed(token: Long): Boolean = gate.permits(token, AiStores.loadSettings().enabled)
     fun checkAllowed(token: Long) { if (!allowed(token)) throw CancellationException("AI 已停用或本轮已取消") }
 
     fun cancelAi() = synchronized(guard) {
-        suspendedByUser = true
-        epoch++
+        gate.stop()
         pending.clear()
         active?.cancel()
         active = null
@@ -90,7 +90,7 @@ object WakeDispatcher {
     }
 
     fun resumeAutomation() = synchronized(guard) {
-        suspendedByUser = false
+        gate.resume()
         lastActivity = SystemClock.elapsedRealtime()
         taskActivity.clear()
     }
@@ -100,13 +100,15 @@ object WakeDispatcher {
         return enqueue("manual", "用户指令：$text")
     }
 
-    fun onRecordingFinished(stepCount: Int) {
-        enqueue("recording_finished", "完成 $stepCount 步录制。请 get_last_recording，补触发条件与 wait_text 结果验证后保存 debug 任务")
+    fun currentToken(): Long = epoch
+    fun onRecordingFinished(stepCount: Int, token: Long) {
+        enqueue("recording_finished", "完成 $stepCount 步录制。请 get_last_recording，补触发条件与 wait_text 结果验证后保存 debug 任务", sourceToken = token)
     }
 
     fun onEngineEvent(e: EngineEvent) {
         val now = SystemClock.elapsedRealtime()
         synchronized(guard) {
+            if (gate.stopped || !MonitoringEngine.isCurrentGeneration(e.generation)) return
             when (e) {
                 is EngineEvent.TaskFired -> {
                     lastActivity = now
@@ -141,9 +143,9 @@ object WakeDispatcher {
         }
     }
 
-    private fun enqueue(type: String, detail: String, taskId: Long? = null): Boolean = synchronized(guard) {
+    private fun enqueue(type: String, detail: String, taskId: Long? = null, sourceToken: Long = epoch): Boolean = synchronized(guard) {
         val s = AiStores.loadSettings()
-        if (!s.enabled || s.baseUrl.isBlank() || s.model.isBlank() || suspendedByUser) return@synchronized false
+        if (!gate.permits(sourceToken, s.enabled) || s.baseUrl.isBlank() || s.model.isBlank()) return@synchronized false
         val ok = pending.offer(WakeEvent(type, detail, taskId, epoch = epoch))
         if (ok) signal.trySend(Unit) else Log.i("WakeDispatcher", "coalesced/full: $type/$taskId")
         ok
@@ -170,7 +172,7 @@ object WakeDispatcher {
                     if (MonitoringEngine.currentTaskName != null) return@synchronized
                     for (rule in AiStores.loadRules().filter { it.type == "idle" }) {
                         if (enabled.none { rule.taskId == null || it.id == rule.taskId }) continue
-                        val last = rule.taskId?.let { taskActivity[it] } ?: lastActivity
+                        val last = rule.taskId?.let { taskActivity.getOrPut(it) { now } } ?: lastActivity
                         if (now - last >= rule.timeoutMs.coerceIn(10000, 3600000)) {
                             enqueue("idle", "指定范围超过 ${rule.timeoutMs / 1000} 秒无活动，请检查画面", rule.taskId)
                             if (rule.taskId == null) lastActivity = now else taskActivity[rule.taskId] = now

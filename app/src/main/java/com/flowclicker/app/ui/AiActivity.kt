@@ -15,6 +15,8 @@ import com.flowclicker.app.ai.WakeDispatcher
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import android.os.Handler
+import android.os.Looper
 
 /** AI 调度员页面：API 配置、手动唤醒、调度日志 */
 class AiActivity : AppCompatActivity() {
@@ -28,6 +30,10 @@ class AiActivity : AppCompatActivity() {
     private lateinit var etDebugRounds: EditText
     private lateinit var etManual: EditText
     private lateinit var tvLog: TextView
+    private val handler = Handler(Looper.getMainLooper())
+    private val refresh = object : Runnable {
+        override fun run() { renderLog(); handler.postDelayed(this, 1000) }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,6 +51,11 @@ class AiActivity : AppCompatActivity() {
         fillSettings(AiStores.loadSettings())
 
         findViewById<Button>(R.id.btnSave).setOnClickListener { save() }
+        findViewById<Button>(R.id.btnStopAi).setOnClickListener {
+            WakeDispatcher.stopAll()
+            stopService(android.content.Intent(this, com.flowclicker.app.service.RecordingService::class.java))
+            renderLog()
+        }
         findViewById<Button>(R.id.btnWake).setOnClickListener {
             val text = etManual.text.toString().trim()
             if (text.isEmpty()) {
@@ -55,15 +66,16 @@ class AiActivity : AppCompatActivity() {
                 etManual.text.clear()
                 Toast.makeText(this, "已唤醒（结果稍后出现在日志里）", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "AI 未启用：请先保存配置并勾选启用", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "未入队：请检查已保存配置；队列可能已满或指令重复", Toast.LENGTH_LONG).show()
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        renderLog()
+        handler.post(refresh)
     }
+    override fun onPause() { handler.removeCallbacks(refresh); super.onPause() }
 
     private fun fillSettings(s: AiSettings) {
         cbEnabled.isChecked = s.enabled
@@ -85,8 +97,11 @@ class AiActivity : AppCompatActivity() {
             maxToolRounds = etMaxRounds.text.toString().toIntOrNull()?.coerceIn(1, 12) ?: 6,
             debugRounds = etDebugRounds.text.toString().toIntOrNull()?.coerceIn(1, 10) ?: 2,
         )
-        AiStores.saveSettings(s)
-        Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+        try {
+            AiStores.saveSettings(s)
+            WakeDispatcher.onSettingsChanged()
+            Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { Toast.makeText(this, e.message, Toast.LENGTH_LONG).show() }
     }
 
     private fun renderLog() {
@@ -102,6 +117,6 @@ class AiActivity : AppCompatActivity() {
         val memory = AiStores.loadMemory()
         val memBlock = if (memory.isEmpty()) "" else
             "【AI 长期记忆】\n" + memory.joinToString("\n") { "· ${it.text}" } + "\n\n————————\n\n"
-        tvLog.text = memBlock + body
+        tvLog.text = "AI：${WakeDispatcher.status}\n\n" + memBlock + body
     }
 }

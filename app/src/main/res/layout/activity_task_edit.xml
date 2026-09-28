@@ -50,6 +50,12 @@
             android:layout_height="wrap_content"
             android:hint="触发关键词，多个用逗号分隔" />
 
+        <Button
+            android:id="@+id/btnAddWaitText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="新增等待/验证文字（推荐作为最后一步）" />
+
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

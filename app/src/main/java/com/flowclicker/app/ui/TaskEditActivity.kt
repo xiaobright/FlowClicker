@@ -22,6 +22,8 @@ import com.flowclicker.app.engine.Task
 import com.flowclicker.app.engine.TaskStore
 import com.flowclicker.app.engine.Trigger
 import com.flowclicker.app.service.RecordingService
+import com.flowclicker.app.engine.MonitoringEngine
+import com.flowclicker.app.core.GestureDispatcher
 
 /** 任务编辑器：触发条件 + 动作序列（点击/滑动/等待/标签控制），步骤内支持坐标拾取 */
 class TaskEditActivity : AppCompatActivity() {
@@ -31,6 +33,7 @@ class TaskEditActivity : AppCompatActivity() {
     }
 
     private var taskId: Long = -1L
+    private var original: Task? = null
     private val steps = mutableListOf<Step>()
 
     private lateinit var etName: EditText
@@ -86,7 +89,8 @@ class TaskEditActivity : AppCompatActivity() {
 
         taskId = intent.getLongExtra(EXTRA_ID, -1L)
         if (taskId >= 0) {
-            TaskStore.loadAll().firstOrNull { it.id == taskId }?.let { t ->
+            MonitoringEngine.tasksSnapshot().firstOrNull { it.id == taskId }?.let { t ->
+                original = t
                 etName.setText(t.name)
                 etTag.setText(t.tag ?: "")
                 etPriority.setText(t.priority.toString())
@@ -105,6 +109,7 @@ class TaskEditActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnAddClick).setOnClickListener { clickDialog(-1) }
         findViewById<Button>(R.id.btnAddSwipe).setOnClickListener { swipeDialog(-1) }
         findViewById<Button>(R.id.btnAddWait).setOnClickListener { waitDialog(-1) }
+        findViewById<Button>(R.id.btnAddWaitText).setOnClickListener { waitTextDialog(-1) }
         findViewById<Button>(R.id.btnAddEnable).setOnClickListener { tagDialog(true, -1) }
         findViewById<Button>(R.id.btnAddDisable).setOnClickListener { tagDialog(false, -1) }
         findViewById<Button>(R.id.btnSave).setOnClickListener { save() }
@@ -132,6 +137,10 @@ class TaskEditActivity : AppCompatActivity() {
     }
 
     private fun startRecording() {
+        if (!GestureDispatcher.isReady) {
+            Toast.makeText(this, "先开启无障碍服务", Toast.LENGTH_LONG).show()
+            return
+        }
         if (!Settings.canDrawOverlays(this)) {
             startActivity(
                 Intent(
@@ -182,9 +191,7 @@ class TaskEditActivity : AppCompatActivity() {
             is Step.Click -> clickDialog(index)
             is Step.Swipe -> swipeDialog(index)
             is Step.Wait -> waitDialog(index)
-            is Step.WaitText -> Toast.makeText(
-                this, "等待文字步骤暂不支持界面编辑（可由 AI 调整或删除后重加）", Toast.LENGTH_SHORT
-            ).show()
+            is Step.WaitText -> waitTextDialog(index)
             is Step.EnableTagged -> tagDialog(true, index)
             is Step.DisableTagged -> tagDialog(false, index)
         }
@@ -229,9 +236,14 @@ class TaskEditActivity : AppCompatActivity() {
         val eY = field(c, "Y (px)", s?.y?.str() ?: "")
         val eAnchor = field(
             c,
-            "OCR 锚点文字（可选，执行时按屏幕文字实时定位，未命中回退坐标）",
+            "OCR 锚点文字（可选，默认未命中/不唯一则停止）",
             s?.anchor ?: ""
         )
+        val fallback = CheckBox(this).apply {
+            text = "锚点缺失/不唯一时仍使用旧坐标（有误点风险）"
+            isChecked = s?.anchorFallback ?: false
+        }
+        c.addView(fallback)
         val eOff = field(c, "随机偏移 ±px", s?.maxOffsetPx?.str() ?: "8")
         val ePress = field(c, "按压时长 ms", s?.pressMs?.toString() ?: "60")
         val ePressJ = field(c, "按压时长抖动 ±ms", s?.pressJitterMs?.toString() ?: "20")
@@ -249,6 +261,7 @@ class TaskEditActivity : AppCompatActivity() {
                     x = eX.str().toFloatOrNull() ?: 0f,
                     y = eY.str().toFloatOrNull() ?: 0f,
                     anchor = eAnchor.str().trim().ifEmpty { null },
+                    anchorFallback = fallback.isChecked,
                     maxOffsetPx = eOff.str().toFloatOrNull() ?: 0f,
                     pressMs = ePress.str().toLongOrNull() ?: 60L,
                     pressJitterMs = ePressJ.str().toLongOrNull() ?: 0L,
@@ -306,6 +319,20 @@ class TaskEditActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun waitTextDialog(index: Int) {
+        val s = steps.getOrNull(index) as? Step.WaitText
+        val c = dialogContainer()
+        val text = field(c, "等待文字（最后一步可作为结果验证）", s?.text ?: "")
+        val timeout = field(c, "超时 ms（500..120000）", (s?.timeoutMs ?: 10000).toString())
+        val present = CheckBox(this).apply { this.text = "等待出现（不勾选=等待消失）"; isChecked = s?.present ?: true }
+        c.addView(present)
+        AlertDialog.Builder(this).setTitle("等待/验证文字").setView(c)
+            .setPositiveButton("确定") { _, _ ->
+                commitStep(Step.WaitText(text.str().trim(), present.isChecked,
+                    timeout.str().toLongOrNull() ?: 10000, s?.region), index)
+            }.setNegativeButton("取消", null).show()
+    }
+
     private fun tagDialog(enable: Boolean, index: Int) {
         val existing: String? = when {
             enable -> (steps.getOrNull(index) as? Step.EnableTagged)?.tag
@@ -332,7 +359,6 @@ class TaskEditActivity : AppCompatActivity() {
     }
 
     private fun save() {
-        val all = TaskStore.loadAll()
         val keywords = etKeywords.text.toString()
             .split(',', '，', ';', '；', ' ')
             .map { it.trim() }
@@ -342,20 +368,29 @@ class TaskEditActivity : AppCompatActivity() {
             Region(region[0]!!, region[1]!!, region[2]!!, region[3]!!)
         } else null
         val tag = etTag.text.toString().trim().ifEmpty { null }
-        val task = Task(
-            id = if (taskId >= 0) taskId else TaskStore.nextId(all),
+        val draft = Task(
+            id = taskId,
             name = etName.text.toString().trim().ifEmpty { "未命名任务" },
             priority = etPriority.text.toString().toIntOrNull() ?: 0,
             tag = tag,
-            trigger = Trigger(region = regionObj, keywords = keywords),
+            trigger = Trigger(region = regionObj, keywords = keywords, ignoreCase = original?.trigger?.ignoreCase ?: true),
             steps = steps.toList(),
-            enabled = all.firstOrNull { it.id == taskId }?.enabled ?: true,
             loop = cbLoop.isChecked,
+            mode = original?.mode ?: Task.MODE_NORMAL,
         )
-        val idx = all.indexOfFirst { it.id == task.id }
-        if (idx >= 0) all[idx] = task else all.add(task)
-        TaskStore.saveAll(all)
-        finish()
+        try {
+            require(region.all { it == null } || region.all { it != null }) { "检测区域需完整填写四个数值" }
+            MonitoringEngine.updateTasks { all ->
+                val idx = all.indexOfFirst { it.id == taskId }
+                if (taskId >= 0) {
+                    check(idx >= 0) { "任务已被删除，请返回列表重新创建" }
+                    val current = all[idx]
+                    check(current.revision == original?.revision) { "任务已被 AI 修改，请返回重开，避免覆盖" }
+                    all[idx] = draft.copy(enabled = current.enabled, mode = current.mode, revision = current.revision)
+                } else all.add(draft.copy(id = TaskStore.nextId(all)))
+            }
+            finish()
+        } catch (e: Exception) { Toast.makeText(this, e.message ?: "保存失败", Toast.LENGTH_LONG).show() }
     }
 
     private fun describe(s: Step): String = when (s) {
@@ -370,8 +405,7 @@ class TaskEditActivity : AppCompatActivity() {
                 " ${s.durationMs}±${s.durationJitterMs}ms 延${s.delayAfterMs}±${s.delayJitterMs}ms"
 
         is Step.Wait -> "等待 ${s.ms}ms"
-        is Step.WaitText ->
-            "等待「${s.text}」${if (s.present) "出现" else "消失"} · 超时${s.timeoutMs}ms"
+        is Step.WaitText -> "等待「${s.text}」${if (s.present) "出现" else "消失"} ≤${s.timeoutMs}ms"
         is Step.EnableTagged -> "启用标签组「${s.tag}」"
         is Step.DisableTagged -> "停用标签组「${s.tag}」"
     }

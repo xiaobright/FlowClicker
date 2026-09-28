@@ -30,6 +30,10 @@ import com.flowclicker.app.core.ScreenControl
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.CancellationException
 import android.widget.Toast
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -70,6 +74,8 @@ class RecordingService : Service() {
     /** 待转发的手势数：>0 时拦截层保持不可触摸，全部完成后恢复 */
     private var pendingForwards = 0
     private var starting = false
+    private var forwardJob: Job? = null
+    private var wakeToken = 0L
 
     // 录制中的手势状态（主线程访问）
     private var downT = 0L
@@ -88,6 +94,7 @@ class RecordingService : Service() {
     }
 
     private fun startNow() {
+        wakeToken = WakeDispatcher.currentToken()
         createChannel()
         if (Build.VERSION.SDK_INT >= 34) {
             ServiceCompat.startForeground(
@@ -100,9 +107,15 @@ class RecordingService : Service() {
         scope.launch {
             try {
                 ScreenControl.withOwner("recording") {
-                    check(GestureDispatcher.isReady) { "先开启无障碍服务" }
-                    buildOverlay()
-                    awaitCancellation()
+                    try {
+                        check(GestureDispatcher.isReady) { "先开启无障碍服务" }
+                        buildOverlay()
+                        awaitCancellation()
+                    } finally {
+                        withContext(NonCancellable) { forwardJob?.cancelAndJoin() }
+                        overlayRoot?.let { runCatching { wm.removeView(it) } }
+                        overlayRoot = null
+                    }
                 }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { Toast.makeText(this@RecordingService, e.message, Toast.LENGTH_LONG).show() }
@@ -224,7 +237,7 @@ class RecordingService : Service() {
         val rec = records.last()
         pendingForwards++
         setTouchable(false)
-        scope.launch {
+        forwardJob = scope.launch {
             try {
                 // NOT_TOUCHABLE 标志传播到输入管线需要一两帧，先等待再注入，
                 // 否则转发手势会被自己的拦截层拦下
@@ -291,7 +304,7 @@ class RecordingService : Service() {
         }
         pendingResult = steps
         lastRecording = steps
-        if (steps.isNotEmpty()) WakeDispatcher.onRecordingFinished(steps.size)
+        if (steps.isNotEmpty()) WakeDispatcher.onRecordingFinished(steps.size, wakeToken)
         stopSelf()
     }
 

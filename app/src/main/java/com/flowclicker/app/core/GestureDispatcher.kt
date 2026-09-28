@@ -23,6 +23,8 @@ import kotlinx.coroutines.withTimeout
 object GestureDispatcher {
 
     private val mutex = Mutex()
+    @Volatile var beforeGesture: (suspend () -> Unit)? = null
+    @Volatile var afterGesture: (() -> Unit)? = null
 
     @Volatile
     private var service: AccessibilityService? = null
@@ -51,6 +53,8 @@ object GestureDispatcher {
         return mutex.withLock {
             currentCoroutineContext().ensureActive()
             val svc = service ?: return@withLock false
+            beforeGesture?.invoke()
+            currentCoroutineContext().ensureActive()
             require(durationMs in 1..5000) { "手势时长必须为 1..5000ms" }
             val metrics = svc.resources.displayMetrics
             require(points.all { (x, y) ->
@@ -64,7 +68,8 @@ object GestureDispatcher {
             }
             // An admitted system gesture cannot be recalled. Keep ownership until its callback,
             // even when the caller stops, so the next owner cannot overlap it.
-            withContext(NonCancellable) { withTimeout(durationMs + 2000) { suspendCancellableCoroutine { cont ->
+            try {
+                withContext(NonCancellable) { withTimeout(durationMs + 2000) { suspendCancellableCoroutine { cont ->
                 val dispatched = svc.dispatchGesture(
                     GestureDescription.Builder()
                         .addStroke(
@@ -85,7 +90,11 @@ object GestureDispatcher {
                     null
                 )
                 if (!dispatched && cont.isActive) cont.resume(false)
-            } } }
+                } } }
+            } finally {
+                // Also invalidate on cancellation/timeout: the screen may already have changed.
+                afterGesture?.invoke()
+            }
         }
     }
 }

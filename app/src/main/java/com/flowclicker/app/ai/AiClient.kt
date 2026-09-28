@@ -100,7 +100,8 @@ class AiClient(private val settings: AiSettings) {
             }
         }
         continuation.invokeOnCancellation {
-            connection.get()?.disconnect()
+            // Do not block the stop button in a platform-specific socket disconnect.
+            CoroutineScope(Dispatchers.IO).launch { connection.get()?.disconnect() }
             worker.cancel()
         }
     }

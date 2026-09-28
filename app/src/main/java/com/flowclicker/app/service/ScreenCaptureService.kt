@@ -8,15 +8,11 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
-import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.Image
-import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Handler
-import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -25,25 +21,21 @@ import androidx.core.content.IntentCompat
 import com.flowclicker.app.R
 import com.flowclicker.app.ai.WakeDispatcher
 import android.content.res.Configuration
-import android.os.SystemClock
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 屏幕采集前台服务：一个 MediaProjection 会话产出共享帧，
- * 所有任务的 OCR 都读同一份 [latestFrame]，而不是各自开录屏。
+ * 所有任务的 OCR 都读同一个采集 worker 的独立帧拷贝。
  */
 class ScreenCaptureService : Service() {
 
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
-    private var imageReader: ImageReader? = null
-    private var captureThread: HandlerThread? = null
-
-    @Volatile
-    private var latestFrame: Bitmap? = null
-    private val frameLock = Any()
-    @Volatile private var acceptingFrames = false
-    @Volatile var frameTime: Long = 0
-        private set
+    @Volatile private var worker: CaptureWorker? = null
+    private var projectionCallback: MediaProjection.Callback? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -79,45 +71,36 @@ class ScreenCaptureService : Service() {
             return START_NOT_STICKY
         }
         projection = p
-        p.registerCallback(object : MediaProjection.Callback() {
+        val callback = object : MediaProjection.Callback() {
             override fun onStop() {
+                if (projection !== p) return
                 Log.i(TAG, "media projection stopped by system")
+                worker?.invalidateFrame()
+                WakeDispatcher.stopAll()
                 stopSelf()
             }
-        }, Handler(mainLooper))
+        }
+        projectionCallback = callback
+        p.registerCallback(callback, Handler(mainLooper))
 
         val metrics = resources.displayMetrics
         val width = metrics.widthPixels
         val height = metrics.heightPixels
         val dpi = metrics.densityDpi
 
-        captureThread = HandlerThread("frame-capture").also { it.start() }
-        val reader = ImageReader.newInstance(width, height, PixelFormat.RGBA_8888, 2)
-        imageReader = reader
-        acceptingFrames = true
-        reader.setOnImageAvailableListener({ r ->
-            val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
-            try {
-                val bmp = imageToBitmap(image)
-                synchronized(frameLock) {
-                    if (acceptingFrames) {
-                        latestFrame?.recycle()
-                        latestFrame = bmp
-                        frameTime = SystemClock.elapsedRealtime()
-                    } else bmp.recycle()
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "frame conversion failed", e)
-            } finally {
-                image.close()
-            }
-        }, Handler(captureThread!!.looper))
-
-        virtualDisplay = p.createVirtualDisplay(
-            "flowclicker-capture", width, height, dpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader.surface, null, null
-        )
+        try {
+            val capture = CaptureWorker(width, height)
+            worker = capture
+            virtualDisplay = p.createVirtualDisplay(
+                "flowclicker-capture", width, height, dpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                capture.surface, null, null
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "capture startup failed", e)
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         isRunning = true
         Log.i(TAG, "capture started ${width}x${height}")
@@ -126,22 +109,25 @@ class ScreenCaptureService : Service() {
     }
 
     override fun onDestroy() {
-        acceptingFrames = false
         WakeDispatcher.stopAll()
         isRunning = false
-        instance = null
-        virtualDisplay?.release()
+        if (instance === this) instance = null
+        val capture = worker
+        worker = null
+        val display = virtualDisplay
         virtualDisplay = null
-        imageReader?.close()
-        imageReader = null
-        projection?.stop()
+        val p = projection
         projection = null
-        synchronized(frameLock) {
-            latestFrame?.recycle()
-            latestFrame = null
+        val callback = projectionCallback
+        projectionCallback = null
+        val releaseProjection = {
+            runCatching { display?.release() }.onFailure { Log.w(TAG, "display release failed", it) }
+            runCatching { if (callback != null) p?.unregisterCallback(callback) }
+                .onFailure { Log.w(TAG, "callback removal failed", it) }
+            runCatching { p?.stop() }.onFailure { Log.w(TAG, "projection stop failed", it) }
+            Unit
         }
-        captureThread?.quitSafely()
-        captureThread = null
+        if (capture != null) capture.close(releaseProjection) else releaseProjection()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }
@@ -153,26 +139,20 @@ class ScreenCaptureService : Service() {
     }
 
     /** 返回独立拷贝，消费方必须 recycle。 */
-    fun currentFrame(): Bitmap? = synchronized(frameLock) {
-        latestFrame?.takeIf { !it.isRecycled }?.copy(Bitmap.Config.ARGB_8888, false)
-    }
+    fun currentFrame(): Bitmap? = worker?.currentFrame()
 
-    private fun imageToBitmap(image: Image): Bitmap {
-        val plane = image.planes[0]
-        val rowPadding = plane.rowStride - plane.pixelStride * image.width
-        return if (rowPadding == 0) {
-            Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888).apply {
-                copyPixelsFromBuffer(plane.buffer)
+    fun invalidateFrame() { worker?.invalidateFrame() }
+
+    suspend fun awaitActionFrame() {
+        val capture = worker ?: error("屏幕采集不可用")
+        val ready = withTimeoutOrNull(5000) {
+            while (worker === capture && !capture.hasRecentFrame()) {
+                currentCoroutineContext().ensureActive()
+                delay(50)
             }
-        } else {
-            val padded = Bitmap.createBitmap(
-                image.width + rowPadding / plane.pixelStride,
-                image.height,
-                Bitmap.Config.ARGB_8888
-            ).apply { copyPixelsFromBuffer(plane.buffer) }
-            try { Bitmap.createBitmap(padded, 0, 0, image.width, image.height) }
-            finally { padded.recycle() }
-        }
+            worker === capture && capture.hasRecentFrame()
+        } ?: false
+        check(ready) { "没有近期有效画面，已暂停操作；请确认采集或重新授权" }
     }
 
     private fun createChannel() {
@@ -187,7 +167,7 @@ class ScreenCaptureService : Service() {
             .setSmallIcon(R.drawable.ic_stat_notify)
             .setContentTitle("屏幕采集中")
             .setContentText("流程点击器正在监测屏幕内容")
-            .addAction(0, "停止全部操作", android.app.PendingIntent.getBroadcast(
+            .addAction(R.drawable.ic_stat_notify, "停止全部操作", android.app.PendingIntent.getBroadcast(
                 this, 0, Intent(this, StopAutomationReceiver::class.java),
                 android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
             ))
@@ -196,7 +176,7 @@ class ScreenCaptureService : Service() {
 
     companion object {
         private const val TAG = "ScreenCapture"
-        private const val CHANNEL_ID = "capture"
+        const val CHANNEL_ID = "capture"
         private const val NOTIF_ID = 1001
         const val EXTRA_RESULT_CODE = "resultCode"
         const val EXTRA_RESULT_DATA = "resultData"

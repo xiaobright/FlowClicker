@@ -15,6 +15,10 @@ import com.flowclicker.app.R
 import com.flowclicker.app.engine.MonitoringEngine
 import com.flowclicker.app.engine.Task
 import com.flowclicker.app.engine.TaskStore
+import com.flowclicker.app.ai.AiStores
+import com.flowclicker.app.ai.WakeDispatcher
+import android.os.Handler
+import android.os.Looper
 
 /** 任务列表：启停任务、启动/停止引擎、进入编辑器 */
 class TaskListActivity : AppCompatActivity() {
@@ -22,12 +26,18 @@ class TaskListActivity : AppCompatActivity() {
     private lateinit var container: LinearLayout
     private lateinit var tvEngineStatus: TextView
     private var tasks: MutableList<Task> = mutableListOf()
+    private val handler = Handler(Looper.getMainLooper())
+    private val refresh = object : Runnable {
+        override fun run() {
+            reload(); render(); updateEngineStatus()
+            handler.postDelayed(this, 1000)
+        }
+    }
 
     private val editorLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) {
         reload()
-        persistAndSync()
         render()
     }
 
@@ -45,30 +55,28 @@ class TaskListActivity : AppCompatActivity() {
                 toast("没有启用的任务")
                 return@setOnClickListener
             }
-            MonitoringEngine.setTasks(tasks)
-            MonitoringEngine.start()
+            try {
+                MonitoringEngine.start()
+                WakeDispatcher.resumeAutomation()
+            } catch (e: Exception) { toast(e.message ?: "启动失败") }
             updateEngineStatus()
         }
         findViewById<Button>(R.id.btnStop).setOnClickListener {
-            MonitoringEngine.stop()
+            WakeDispatcher.stopAll()
+            stopService(Intent(this, com.flowclicker.app.service.RecordingService::class.java))
             updateEngineStatus()
         }
     }
 
     override fun onResume() {
         super.onResume()
-        reload()
-        render()
-        updateEngineStatus()
+        handler.post(refresh)
     }
+
+    override fun onPause() { handler.removeCallbacks(refresh); super.onPause() }
 
     private fun reload() {
-        tasks = TaskStore.loadAll()
-    }
-
-    private fun persistAndSync() {
-        TaskStore.saveAll(tasks)
-        MonitoringEngine.setTasks(tasks)
+        tasks = MonitoringEngine.tasksSnapshot().toMutableList()
     }
 
     private fun render() {
@@ -86,12 +94,14 @@ class TaskListActivity : AppCompatActivity() {
         val sw = Switch(this).apply {
             isChecked = t.enabled
             setOnCheckedChangeListener { _, checked ->
-                val idx = tasks.indexOfFirst { it.id == t.id }
-                if (idx >= 0 && tasks[idx].enabled != checked) {
-                    tasks[idx] = tasks[idx].copy(enabled = checked)
-                    persistAndSync()
-                    updateEngineStatus()
-                }
+                try {
+                    MonitoringEngine.updateTasks { list ->
+                        val idx = list.indexOfFirst { it.id == t.id }
+                        check(idx >= 0) { "任务已删除" }
+                        list[idx] = list[idx].copy(enabled = checked)
+                    }
+                } catch (e: Exception) { toast(e.message ?: "保存失败") }
+                reload(); updateEngineStatus()
             }
         }
         val tv = TextView(this).apply {
@@ -102,6 +112,8 @@ class TaskListActivity : AppCompatActivity() {
                 append(t.trigger.keywords.joinToString(" / ").ifEmpty { "（未设置）" })
                 append(" · ${t.steps.size}步 · ")
                 append(if (t.loop) "循环" else "单次")
+                append(" · ${t.mode} · v${t.revision}")
+                if (t.id in MonitoringEngine.pendingReviews()) append(" · 待验收/已暂停")
             }
             setPadding(dp(12), 0, dp(12), 0)
             setOnClickListener {
@@ -126,8 +138,11 @@ class TaskListActivity : AppCompatActivity() {
             .setTitle("删除任务")
             .setMessage("确定删除「${t.name}」？")
             .setPositiveButton("删除") { _, _ ->
-                tasks.removeAll { it.id == id }
-                persistAndSync()
+                try {
+                    MonitoringEngine.updateTasks { it.removeAll { t -> t.id == id } }
+                    AiStores.deleteTaskData(id)
+                } catch (e: Exception) { toast(e.message ?: "删除失败") }
+                reload()
                 render()
             }
             .setNegativeButton("取消", null)
@@ -136,7 +151,7 @@ class TaskListActivity : AppCompatActivity() {
 
     private fun updateEngineStatus() {
         tvEngineStatus.text = if (MonitoringEngine.isMonitoring) {
-            "引擎：运行中${MonitoringEngine.currentTaskName?.let { " · 执行：$it" } ?: " · 监测中"}"
+            "引擎：运行中${MonitoringEngine.currentTaskName?.let { " · 执行：$it" } ?: " · 监测/等待中"} · ${com.flowclicker.app.core.ScreenControl.owner ?: "空闲"}"
         } else {
             "引擎：已停止"
         }
