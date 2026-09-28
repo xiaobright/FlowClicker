@@ -53,6 +53,8 @@ uv run --no-project E:\Desktop\mytests\android-test\tools\adb_debug.py --serial 
 - stdout 为 JSON：`{"id":"...","ok":true,"result":...}` 或 `{"id":"...","ok":false,"error":"..."}`。
 - 退出码：0 命令成功/已受理；1 App 命令错误；2 传输/输入/权限错误。**ADB 返回 0 不代表命令执行成功。**
 - stderr 先打印 request_id。每个请求最多 64 KiB，在广播中仅传 base64；结果写 App 私有 `cache/adb-debug/<id>.json`，不把敏感内容塞进 logcat。
+- 广播必须同时携带 `-a com.flowclicker.app.DEBUG_COMMAND` 和显式组件 `-n com.flowclicker.app/.debug.DebugCommandReceiver`。已在 EMUI/API 29 实测：缺 action 时系统将接收器标为 `Skipped`（虽然广播仍为 `ordered=true`），补 action 后原 APK 正常返回。不要因此移除 ordered/debuggable/DUMP 门卫，也不要把 `result=0` 或组件解析记录当成已送达。
+- EMUI 后台代理还可能先返回空回执、再真正投递。仅对 CLI 本次自动生成的新 UUID，缺回执时最多轮询同一结果 10 秒（另受每次 ADB 25 秒传输超时约束），等待缺文件/`IN_PROGRESS_OR_INTERRUPTED` 变成完成结果；**不重新广播**。接收器明确拒绝、响应 ID/格式异常不走成功回退。显式 `--request-id` 缺回执时也不回退，以免读取旧请求的成功；退出 2 不证明未执行，应使用 `result` 核对。
 - 同一 ID 在设备缓存存在时永不再次执行；不要重发，用以下命令读取。`IN_PROGRESS_OR_INTERRUPTED` 表示可能在执行或进程中断，先查状态，不自动重试有副作用命令。
 
 ```powershell
@@ -76,3 +78,4 @@ uv run --no-project E:\Desktop\mytests\android-test\tools\adb_debug.py --serial 
 - `tools/test_adb_debug_device.py`：先备份、停止采集再执行；会临时修改 AI/规则并创建一个 disabled 测试任务，finally 还原定义。字节级恢复仍需 `tools/device_snapshot.py`。
 - `tools/test_adb_debug_capture.py`：先通过系统授权启动采集并前台显示 androidTest 的 `RepairTestActivity`；只读验证 OCR、定位、PNG 与请求 ID，不启动引擎或模型。
 - 实测结果与未覆盖项见 `ADB-DEBUG-ACCEPTANCE.md`，断点清单见 `ADB-DEBUG-CHECKLIST.md`。真实验收必须先通过相同主 APK 的 mock 套件；不要同时运行多个 instrumentation / uiautomator。
+- EMUI/API 29 的 CLI action 修复、根因对照及本轮实机覆盖见 `PHONE-RETEST-REPORT.md`；其结论更正 `PHONE-SMOKE-REPORT.md` 对 ordered 语义的旧推断。

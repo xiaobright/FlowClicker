@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import uuid
 
-from adb_debug import DebugClient, encode_request, PACKAGE, RECEIVER
+from adb_debug import ACTION, DebugClient, encode_request, PACKAGE, RECEIVER
 
 
 def main():
@@ -34,11 +34,13 @@ def main():
         assert not client.command("ai.wake", {"text": "不得发送真实请求"})["ok"]
         assert not client.command("unknown")["ok"]
         outcomes.append("PASS missing-capture/disabled-AI/unknown-command failures")
-        rid = uuid.uuid4().hex
         task = {"id": 0, "name": "回归·ADB 中文 \"quotes\" ; $()", "enabled": False,
                 "steps": [{"type": "wait", "ms": 1}]}
-        created = ok("tasks.upsert", {"task": task}, request_id=rid)
-        test_id = created["id"]
+        # Let the CLI own the fresh ID so EMUI's empty-ack fallback is safe.
+        created = client.command("tasks.upsert", {"task": task})
+        assert created["ok"], created
+        rid = created["id"]
+        test_id = created["result"]["id"]
         try:
             client.command("tasks.upsert", {"task": task}, request_id=rid)
             raise AssertionError("duplicate request unexpectedly accepted")
@@ -65,7 +67,7 @@ def main():
         denied_id = uuid.uuid4().hex
         payload = encode_request(denied_id, "status", {})
         denied = client.run("shell", "run-as", f"{PACKAGE}.test", "am", "broadcast", "--user", "0",
-                            "-n", RECEIVER, "--es", "payload", payload).decode(errors="replace")
+                            "-a", ACTION, "-n", RECEIVER, "--es", "payload", payload).decode(errors="replace")
         assert f"FLOWCLICKER:{denied_id}" not in denied
         try:
             client.result(denied_id)

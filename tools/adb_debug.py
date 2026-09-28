@@ -6,16 +6,21 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 import uuid
 
 PACKAGE = "com.flowclicker.app"
 RECEIVER = f"{PACKAGE}/.debug.DebugCommandReceiver"
+ACTION = f"{PACKAGE}.DEBUG_COMMAND"
 COMMANDS = (
     "status", "automation.stop", "engine.start", "engine.stop", "capture.stop",
     "ai.enabled", "ai.cancel", "ai.wake", "tasks.list", "tasks.get", "tasks.upsert",
     "tasks.delete", "tasks.enabled", "tasks.run", "tasks.result", "rules.get",
     "rules.set", "screen.describe", "screen.locate", "frame.dump", "result",
 )
+
+class ResultUnavailable(RuntimeError):
+    """The result file is absent or not yet readable as a complete response."""
 
 
 def validate_id(request_id):
@@ -55,20 +60,36 @@ class DebugClient:
                                        f"cache/adb-debug/{request_id}.json"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             # adb exec-out may report exit 0 even when remote cat cannot find the file.
-            raise RuntimeError(f"result unavailable or incomplete; request_id={request_id}") from error
-        if value.get("id") != request_id or not isinstance(value.get("ok"), bool):
+            raise ResultUnavailable(f"result unavailable or incomplete; request_id={request_id}") from error
+        if not isinstance(value, dict) or value.get("id") != request_id or not isinstance(value.get("ok"), bool):
             raise ValueError("invalid or mismatched response")
         return value
 
     def command(self, command, args=None, request_id=None):
+        fresh_id = request_id is None
         request_id = validate_id(request_id) if request_id else uuid.uuid4().hex
         payload = encode_request(request_id, command, args or {})
         print(f"request_id={request_id}", file=sys.stderr, flush=True)
         # Base64 is deliberately the only non-constant argument crossing adb's remote shell.
+        # EMUI can skip even explicit broadcasts with a null action before receiver delivery.
         output = self.run("shell", "am", "broadcast", "--receiver-foreground",
-                          "-n", RECEIVER, "--es", "payload", payload).decode("utf-8", errors="replace")
+                          "-a", ACTION, "-n", RECEIVER, "--es", "payload", payload).decode("utf-8", errors="replace")
         if f"FLOWCLICKER:{request_id}" not in output:
-            raise RuntimeError(f"broadcast not accepted; request_id={request_id}; no automatic retry")
+            # EMUI's background proxy may acknowledge before delivering the ordered broadcast.
+            # Only our new UUID can use this fallback: an explicit ID could point at old success.
+            # Never resend, and never turn an explicit receiver rejection into a cached success.
+            if fresh_id and "FLOWCLICKER:" not in output:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    try:
+                        response = self.result(request_id)
+                        if response.get("error") != "IN_PROGRESS_OR_INTERRUPTED":
+                            return response
+                    except ResultUnavailable:
+                        pass
+                    time.sleep(0.25)
+            raise RuntimeError(f"broadcast acknowledgement unavailable; command may have executed; "
+                               f"request_id={request_id}; inspect result; no automatic retry")
         return self.result(request_id)
 
     def download_frame(self, response, output):
