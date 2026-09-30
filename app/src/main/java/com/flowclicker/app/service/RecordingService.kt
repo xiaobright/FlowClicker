@@ -40,6 +40,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import android.view.ContextThemeWrapper
+import com.flowclicker.app.ui.Ui
+import com.flowclicker.app.ui.Ui.add
 
 /**
  * 序列录制：悬浮条 + 全屏触摸拦截层。
@@ -125,48 +128,36 @@ class RecordingService : Service() {
 
     private fun buildOverlay() {
         val dp = { v: Int -> (v * resources.displayMetrics.density).toInt() }
-
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(0xE6111827.toInt())
-            setPadding(dp(12), dp(8), dp(12), dp(8))
+        val themed = ContextThemeWrapper(this, R.style.Theme_FlowClicker)
+        val bar = Ui.column(themed, 16).apply {
+            id = R.id.recordPanel
+            background = Ui.background(themed, R.color.fc_surface, 24, R.color.fc_outline)
+            elevation = dp(8).toFloat()
         }
-        tvTitle = TextView(this).apply {
-            text = "录制中 · 0 步"
-            setTextColor(0xFFFFFFFF.toInt())
-            textSize = 15f
-        }
-        // 等宽按钮铺满悬浮条，位置可预测
-        fun barButton(text: String, onClick: () -> Unit): Button =
-            Button(this).apply {
-                this.text = text
-                textSize = 14f
-                isAllCaps = false
-                setOnClickListener {
-                    Log.i(TAG, "bar button clicked: $text")
-                    onClick()
-                }
-            }
-        bar.addView(
-            tvTitle,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.2f)
-        )
-        listOf("主屏" to { goHome() }, "完成" to { finishRecording() }, "取消" to { stopSelf() })
-            .forEach { (label, action) ->
-                bar.addView(
-                    barButton(label, action),
-                    LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                )
-            }
+        tvTitle = Ui.text(themed, "●  录制中 · 0 步", 16, R.color.fc_primary, true)
+        bar.add(tvTitle!!)
+        bar.add(Ui.text(themed, "操作会实时转发到下层应用", 12, R.color.fc_muted), 2)
+        bar.add(Ui.row(themed,
+            Ui.button(themed, "主屏", R.id.recordHome, "quiet") { goHome() },
+            Ui.button(themed, "完成", R.id.recordFinish) { finishRecording() },
+            Ui.button(themed, "取消", R.id.recordCancel, "danger") { stopSelf() }), 10)
 
-        val touch = View(this).apply { setBackgroundColor(0x12000000) }
+        val touch = View(this).apply {
+            id = R.id.recordTouch
+            contentDescription = "录制触摸区域"
+            setBackgroundColor(0x08000000)
+        }
         touch.setOnTouchListener { v, e -> onTouch(e, v) }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(bar, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            addView(touch, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            addView(bar, LinearLayout.LayoutParams(
+                minOf(resources.displayMetrics.widthPixels - dp(24), dp(380)), -2
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+                setMargins(dp(12), dp(12), dp(12), dp(12))
+            })
+            addView(touch, LinearLayout.LayoutParams(-1, 0, 1f))
         }
 
         val p = WindowManager.LayoutParams(
@@ -179,7 +170,8 @@ class RecordingService : Service() {
         params = p
         overlayRoot = root
         wm.addView(root, p)
-        touch.post { touch.getLocationOnScreen(touchOffset) }
+        // Includes card height / margins and remains correct after overlay relayout.
+        touch.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> touch.getLocationOnScreen(touchOffset) }
     }
 
     private fun goHome() {
@@ -194,6 +186,7 @@ class RecordingService : Service() {
         val now = SystemClock.uptimeMillis()
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                v.getLocationOnScreen(touchOffset)
                 downT = now
                 startX = e.x
                 startY = e.y
@@ -225,7 +218,7 @@ class RecordingService : Service() {
                 val dur = (now - downT).coerceIn(40, 5000)
                 val isTap = maxDist < 14f
                 records.add(GestureRecord(downT, now, isTap, samples.toList()))
-                tvTitle?.text = "录制中 · ${records.size} 步"
+                tvTitle?.text = "●  录制中 · ${records.size} 步"
                 Log.i(TAG, "gesture #${records.size} recorded: tap=$isTap dur=${dur}ms samples=${samples.size}")
                 forward(isTap, dur)
             }

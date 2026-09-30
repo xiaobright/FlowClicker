@@ -19,6 +19,9 @@ import com.flowclicker.app.ai.AiStores
 import com.flowclicker.app.ai.WakeDispatcher
 import android.os.Handler
 import android.os.Looper
+import com.flowclicker.app.ui.Ui.add
+import com.flowclicker.app.ui.Ui.dp
+import com.google.android.material.switchmaterial.SwitchMaterial
 
 /** 任务列表：启停任务、启动/停止引擎、进入编辑器 */
 class TaskListActivity : AppCompatActivity() {
@@ -26,6 +29,8 @@ class TaskListActivity : AppCompatActivity() {
     private lateinit var container: LinearLayout
     private lateinit var tvEngineStatus: TextView
     private var tasks: MutableList<Task> = mutableListOf()
+    private var renderedTasks: List<Task>? = null
+    private var renderedReviews: Set<Long> = emptySet()
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
         override fun run() {
@@ -43,7 +48,7 @@ class TaskListActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_task_list)
+        Screens.tasks(this)
         container = findViewById(R.id.llTasks)
         tvEngineStatus = findViewById(R.id.tvEngineStatus)
 
@@ -80,56 +85,50 @@ class TaskListActivity : AppCompatActivity() {
     }
 
     private fun render() {
+        val reviews = MonitoringEngine.pendingReviews().toSet()
+        if (renderedTasks == tasks && renderedReviews == reviews) return
+        renderedTasks = tasks.toList()
+        renderedReviews = reviews
         container.removeAllViews()
-        tasks.sortedBy { it.priority }.forEach { container.addView(makeRow(it)) }
+        if (tasks.isEmpty()) {
+            Ui.card(container, 16) {
+                add(Ui.text(this@TaskListActivity, "从第一个小流程开始", 19, bold = true))
+                add(Ui.text(this@TaskListActivity, "比如：识别一个关键词、点击按钮，再验证结果。点击上方「新建任务」开始。", 14, com.flowclicker.app.R.color.fc_muted), 10)
+            }
+        } else tasks.sortedBy { it.priority }.forEach { makeRow(it) }
     }
 
-    private fun makeRow(t: Task): LinearLayout {
-        val dp = { v: Int -> (v * resources.displayMetrics.density).toInt() }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, dp(12), 0, dp(12))
+    private fun makeRow(t: Task) {
+        val a = this
+        Ui.card(container, 12) {
+            val header = LinearLayout(a).apply { gravity = Gravity.CENTER_VERTICAL }
+            header.addView(Ui.text(a, t.name, 19, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
+            header.addView(SwitchMaterial(a).apply {
+                contentDescription = "启用任务 ${t.name}"
+                minHeight = a.dp(48)
+                isChecked = t.enabled
+                setOnCheckedChangeListener { _, checked ->
+                    try {
+                        MonitoringEngine.updateTasks { list ->
+                            val idx = list.indexOfFirst { it.id == t.id }
+                            check(idx >= 0) { "任务已删除" }
+                            list[idx] = list[idx].copy(enabled = checked)
+                        }
+                    } catch (e: Exception) { toast(e.message ?: "保存失败") }
+                    reload(); render(); updateEngineStatus()
+                }
+            })
+            add(header)
+            add(Ui.text(a, "触发  /  " + t.trigger.keywords.joinToString(" · ").ifEmpty { "未设置关键词" }, 14, R.color.fc_muted), 4)
+            add(Ui.text(a, "${t.steps.size} 个步骤  ·  ${if (t.loop) "循环" else "单次"}  ·  ${if (t.mode == Task.MODE_DEBUG) "调试模式" else "标准模式"}  ·  v${t.revision}", 12, R.color.fc_muted), 10)
+            t.tag?.let { add(Ui.badge(a, "标签 · $it"), 10) }
+            if (t.id in renderedReviews) add(Ui.badge(a, "待验收 · 已暂停"), 10)
+            add(Ui.row(a,
+                Ui.button(a, "编辑流程", tone = "soft") {
+                    editorLauncher.launch(Intent(a, TaskEditActivity::class.java).putExtra(TaskEditActivity.EXTRA_ID, t.id))
+                },
+                Ui.button(a, "删除", tone = "quiet") { confirmDelete(t.id) }), 14)
         }
-        val sw = Switch(this).apply {
-            isChecked = t.enabled
-            setOnCheckedChangeListener { _, checked ->
-                try {
-                    MonitoringEngine.updateTasks { list ->
-                        val idx = list.indexOfFirst { it.id == t.id }
-                        check(idx >= 0) { "任务已删除" }
-                        list[idx] = list[idx].copy(enabled = checked)
-                    }
-                } catch (e: Exception) { toast(e.message ?: "保存失败") }
-                reload(); updateEngineStatus()
-            }
-        }
-        val tv = TextView(this).apply {
-            text = buildString {
-                append(t.name)
-                t.tag?.let { append("\n标签：$it") }
-                append("\n触发：")
-                append(t.trigger.keywords.joinToString(" / ").ifEmpty { "（未设置）" })
-                append(" · ${t.steps.size}步 · ")
-                append(if (t.loop) "循环" else "单次")
-                append(" · ${t.mode} · v${t.revision}")
-                if (t.id in MonitoringEngine.pendingReviews()) append(" · 待验收/已暂停")
-            }
-            setPadding(dp(12), 0, dp(12), 0)
-            setOnClickListener {
-                editorLauncher.launch(
-                    Intent(this@TaskListActivity, TaskEditActivity::class.java)
-                        .putExtra(TaskEditActivity.EXTRA_ID, t.id)
-                )
-            }
-            setOnLongClickListener {
-                confirmDelete(t.id)
-                true
-            }
-        }
-        row.addView(sw)
-        row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        return row
     }
 
     private fun confirmDelete(id: Long) {
@@ -150,11 +149,15 @@ class TaskListActivity : AppCompatActivity() {
     }
 
     private fun updateEngineStatus() {
-        tvEngineStatus.text = if (MonitoringEngine.isMonitoring) {
-            "引擎：运行中${MonitoringEngine.currentTaskName?.let { " · 执行：$it" } ?: " · 监测/等待中"} · ${com.flowclicker.app.core.ScreenControl.owner ?: "空闲"}"
+        val status = if (MonitoringEngine.isMonitoring) {
+            MonitoringEngine.currentTaskName?.let { "执行中 · $it" } ?: "监测中 · 等待触发"
         } else {
-            "引擎：已停止"
+            "监测已停止"
         }
+        if (tvEngineStatus.text.toString() != status) tvEngineStatus.text = status
+        val count = "${tasks.size} 个任务 · ${tasks.count { it.enabled }} 个已启用"
+        findViewById<TextView>(R.id.tvTaskCount).let { if (it.text.toString() != count) it.text = count }
+        findViewById<Button>(R.id.btnStart).isEnabled = !MonitoringEngine.isMonitoring
     }
 
     private fun toast(msg: String) {

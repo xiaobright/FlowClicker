@@ -29,8 +29,18 @@ import android.content.pm.PackageManager
 import androidx.appcompat.app.AlertDialog
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import android.os.Handler
+import android.os.Looper
+import com.flowclicker.app.ui.Screens
 
 class MainActivity : AppCompatActivity() {
+    private val statusHandler = Handler(Looper.getMainLooper())
+    private val refreshStatus = object : Runnable {
+        override fun run() {
+            updateStatus()
+            statusHandler.postDelayed(this, 500)
+        }
+    }
 
     private val notificationLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -45,28 +55,24 @@ class MainActivity : AppCompatActivity() {
         val data = result.data
         if (result.resultCode == RESULT_OK && data != null) {
             ScreenCaptureService.start(this, result.resultCode, data)
-            // 服务真正跑起来晚于 onResume，延迟刷新一次状态显示
-            findViewById<TextView>(R.id.tvStatus).postDelayed({ updateStatus() }, 1500)
         }
         updateStatus()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        Screens.home(this)
 
         findViewById<Button>(R.id.btnAccessibility).setOnClickListener {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         }
         findViewById<Button>(R.id.btnOverlay).setOnClickListener {
-            if (!Settings.canDrawOverlays(this)) {
-                startActivity(
-                    Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:$packageName")
-                    )
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName")
                 )
-            }
+            )
         }
         findViewById<Button>(R.id.btnCaptureStart).setOnClickListener {
             requestCapture()
@@ -142,7 +148,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 全链路验证任务：OCR 识别到主界面的"权限设置"字样后，
+     * 全链路验证任务：OCR 识别到主界面的"无障碍"字样后，
      * 点击"开启无障碍服务"按钮（坐标在测试启动时按当前屏幕位置计算）。
      * 预期效果：设置应用被自动打开。单次执行后任务自动停用。
      */
@@ -160,26 +166,29 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "请先停止当前操作，再运行隔离测试", Toast.LENGTH_LONG).show()
             return
         }
-        val loc = IntArray(2)
-        target.getLocationOnScreen(loc)
-        val testTask = Task(
-            id = 1,
-            name = "测试任务",
-            trigger = Trigger(region = null, keywords = listOf("权限设置")),
-            steps = listOf(
-                Step.WaitText(text = "权限设置", timeoutMs = 5000),
-                Step.Click(
-                    x = loc[0] + target.width / 2f,
-                    y = loc[1] + target.height / 2f,
-                    maxOffsetPx = 6f,
-                    pressMs = 60,
-                    delayAfterMs = 300
-                ),
-                Step.WaitText(text = "无障碍", timeoutMs = 10000)
-            ),
-            loop = false
-        )
         lifecycleScope.launch {
+            // The test action is below the fold. Reveal its target before measuring coordinates.
+            target.requestRectangleOnScreen(android.graphics.Rect(0, 0, target.width, target.height), true)
+            kotlinx.coroutines.delay(250)
+            val loc = IntArray(2)
+            target.getLocationOnScreen(loc)
+            val testTask = Task(
+                id = 1,
+                name = "测试任务",
+                trigger = Trigger(region = null, keywords = listOf("无障碍")),
+                steps = listOf(
+                    Step.WaitText(text = "无障碍", timeoutMs = 5000),
+                    Step.Click(
+                        x = loc[0] + target.width / 2f,
+                        y = loc[1] + target.height / 2f,
+                        maxOffsetPx = 6f,
+                        pressMs = 60,
+                        delayAfterMs = 300
+                    ),
+                    Step.WaitText(text = "无障碍", timeoutMs = 10000)
+                ),
+                loop = false
+            )
             try {
                 val result = MonitoringEngine.preview(testTask)
                 Toast.makeText(this@MainActivity, "隔离测试：${if (result.completed) "完成" else result.reason}，任务库未修改", Toast.LENGTH_LONG).show()
@@ -190,19 +199,41 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        updateStatus()
+        statusHandler.post(refreshStatus)
+    }
+
+    override fun onPause() {
+        statusHandler.removeCallbacks(refreshStatus)
+        super.onPause()
     }
 
     private fun updateStatus() {
         val a11y = ClickerAccessibilityService.instance != null
         val overlay = Settings.canDrawOverlays(this)
         val capture = ScreenCaptureService.isRunning
-        findViewById<TextView>(R.id.tvStatus).text = buildString {
-            append("状态：")
-            append(if (a11y) "无障碍✓ " else "无障碍✗ ")
-            append(if (overlay) "悬浮窗✓ " else "悬浮窗✗ ")
-            append(if (capture) "采集✓" else "采集✗")
-            if (!captureNotificationsEnabled()) append(" · 通知停止入口不可见")
+        fun label(id: Int, value: String) {
+            findViewById<TextView>(id).let { if (it.text.toString() != value) it.text = value }
         }
+        val tasks = MonitoringEngine.tasksSnapshot()
+        label(R.id.tvHomeTitle, when {
+            MonitoringEngine.isMonitoring -> "流程正在运行"
+            capture && a11y -> "已就绪，随时开始"
+            capture -> "屏幕采集中"
+            else -> "准备开始"
+        })
+        label(R.id.tvStatus, when {
+            MonitoringEngine.isMonitoring -> MonitoringEngine.currentTaskName ?: "正在观察屏幕，等待触发条件"
+            capture -> "屏幕已连接，前往任务页启动监测"
+            else -> "当前没有采集屏幕或执行任务"
+        })
+        label(R.id.tvTaskSummary, "${tasks.size} 个任务   /   ${tasks.count { it.enabled }} 个已启用")
+        label(R.id.tvAccessStatus, if (a11y) "已连接 · 可以派发点击和滑动" else "未连接 · 自动操作需要此权限")
+        label(R.id.tvOverlayStatus, if (overlay) "已授权 · 可以使用悬浮录制面板" else "未授权 · 用于显示悬浮录制面板")
+        label(R.id.tvCaptureStatus, (if (capture) "采集中 · 屏幕内容正在提供给 OCR" else "未开启 · 开启时需确认系统授权") +
+            if (!captureNotificationsEnabled()) "\n通知停止入口不可见，请检查通知设置。" else "")
+        label(R.id.btnAccessibility, if (a11y) "管理无障碍服务" else "开启无障碍服务")
+        label(R.id.btnOverlay, if (overlay) "管理悬浮窗权限" else "授予悬浮窗权限")
+        findViewById<Button>(R.id.btnCaptureStart).isEnabled = !capture
+        findViewById<Button>(R.id.btnCaptureStop).isEnabled = capture
     }
 }

@@ -1,10 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.FlowClicker" parent="Theme.Material3.DayNight.NoActionBar" />
+    <style name="Theme.FlowClicker" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/fc_primary</item>
+        <item name="colorOnPrimary">@color/fc_on_primary</item>
+        <item name="colorPrimaryContainer">@color/fc_primary_soft</item>
+        <item name="colorOnPrimaryContainer">@color/fc_text</item>
+        <item name="colorSecondary">@color/fc_primary</item>
+        <item name="colorSecondaryContainer">@color/fc_primary_soft</item>
+        <item name="colorOnSecondaryContainer">@color/fc_primary</item>
+        <item name="colorSurface">@color/fc_surface</item>
+        <item name="colorOnSurface">@color/fc_text</item>
+        <item name="colorOnSurfaceVariant">@color/fc_muted</item>
+        <item name="colorOutline">@color/fc_outline</item>
+        <item name="colorError">@color/fc_danger</item>
+        <item name="android:colorBackground">@color/fc_background</item>
+        <item name="android:windowBackground">@color/fc_background</item>
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">@bool/fc_light_bars</item>
+        <item name="android:windowLightNavigationBar">@bool/fc_light_bars</item>
+        <item name="android:statusBarColor">@color/fc_background</item>
+        <item name="android:navigationBarColor">@color/fc_background</item>
+    </style>
     <style name="Theme.FlowClicker.Picker">
         <item name="android:windowIsTranslucent">true</item>
         <item name="android:windowBackground">@android:color/transparent</item>
         <item name="android:backgroundDimEnabled">false</item>
     </style>
-    <color name="ic_launcher_background">#1E293B</color>
+    <color name="ic_launcher_background">#183D33</color>
+    <bool name="fc_light_bars">true</bool>
 </resources>

@@ -30,6 +30,18 @@ class CaptureRepairInstrumentation : Instrumentation() {
             // onCreate starts this thread before Application.onCreate has necessarily finished.
             // Take baselines only after its main-thread initialization has completed.
             waitForIdleSync()
+            if (suite == "ui") {
+                UiRedesignChecks(this).run()
+                results.putString("stream", "UI REDESIGN CHECKS PASS\n")
+                finish(Activity.RESULT_OK, results)
+                return
+            }
+            if (suite == "ui-overlay") {
+                UiOverlayChecks(this).run()
+                results.putString("stream", "UI OVERLAY CHECKS PASS\n")
+                finish(Activity.RESULT_OK, results)
+                return
+            }
             if (suite == "permission") {
                 val activity = startActivitySync(Intent(targetContext, MainActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))

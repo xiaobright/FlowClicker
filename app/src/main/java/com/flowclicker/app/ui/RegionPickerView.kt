@@ -6,6 +6,8 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.view.MotionEvent
 import android.view.View
+import com.flowclicker.app.R
+import com.flowclicker.app.ui.Ui.dp
 
 /**
  * 拖拽框选视图：选中区域外加深色遮罩，框线高亮并显示像素尺寸。
@@ -22,12 +24,13 @@ class RegionPickerView(context: Context) : View(context) {
     private val dimPaint = Paint().apply { color = 0x55000000 }
     private val boxPaint = Paint().apply {
         style = Paint.Style.STROKE
-        strokeWidth = 5f
-        color = 0xFF38BDF8.toInt()
+        strokeWidth = context.dp(2).toFloat()
+        color = 0xFFD2F2AF.toInt()
+        isAntiAlias = true
     }
     private val textPaint = Paint().apply {
         color = 0xFFFFFFFF.toInt()
-        textSize = 38f
+        textSize = 14 * resources.displayMetrics.scaledDensity
         isAntiAlias = true
     }
 
@@ -39,6 +42,7 @@ class RegionPickerView(context: Context) : View(context) {
     override fun onTouchEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                getLocationOnScreen(screenOffset)
                 start = event.x to event.y
                 cur = start
             }
@@ -66,6 +70,7 @@ class RegionPickerView(context: Context) : View(context) {
                 start = null
                 cur = null
             }
+            MotionEvent.ACTION_CANCEL -> { start = null; cur = null }
         }
         invalidate()
         return true

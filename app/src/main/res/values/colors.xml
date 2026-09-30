@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="fc_background">#F4F6F3</color>
+    <color name="fc_surface">#FFFFFF</color>
+    <color name="fc_surface_soft">#EDF2EE</color>
+    <color name="fc_text">#192D29</color>
+    <color name="fc_muted">#586D65</color>
+    <color name="fc_primary">#216653</color>
+    <color name="fc_on_primary">#FFFFFF</color>
+    <color name="fc_primary_soft">#E0EFE5</color>
+    <color name="fc_outline">#DCE5DF</color>
+    <color name="fc_danger">#AD3838</color>
+    <color name="fc_danger_soft">#FCECEC</color>
+    <color name="fc_hero">#183D33</color>
+    <color name="fc_hero_muted">#BAD6C8</color>
+    <color name="fc_hero_accent">#D2F2AF</color>
+</resources>

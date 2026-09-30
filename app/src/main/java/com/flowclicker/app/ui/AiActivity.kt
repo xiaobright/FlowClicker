@@ -17,6 +17,7 @@ import java.util.Date
 import java.util.Locale
 import android.os.Handler
 import android.os.Looper
+import android.view.View
 
 /** AI 调度员页面：API 配置、手动唤醒、调度日志 */
 class AiActivity : AppCompatActivity() {
@@ -37,7 +38,7 @@ class AiActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_ai)
+        Screens.ai(this)
         cbEnabled = findViewById(R.id.cbEnabled)
         cbVlm = findViewById(R.id.cbVlm)
         etBaseUrl = findViewById(R.id.etBaseUrl)
@@ -49,6 +50,12 @@ class AiActivity : AppCompatActivity() {
         tvLog = findViewById(R.id.tvLog)
 
         fillSettings(AiStores.loadSettings())
+        val panel = findViewById<View>(R.id.aiSettingsPanel)
+        val configured = AiStores.loadSettings().let { it.baseUrl.isNotBlank() && it.model.isNotBlank() }
+        panel.visibility = if (savedInstanceState?.getBoolean("settingsOpen") ?: !configured) View.VISIBLE else View.GONE
+        findViewById<Button>(R.id.btnAiSettings).setOnClickListener {
+            panel.visibility = if (panel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+        }
 
         findViewById<Button>(R.id.btnSave).setOnClickListener { save() }
         findViewById<Button>(R.id.btnStopAi).setOnClickListener {
@@ -76,6 +83,11 @@ class AiActivity : AppCompatActivity() {
         handler.post(refresh)
     }
     override fun onPause() { handler.removeCallbacks(refresh); super.onPause() }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("settingsOpen", findViewById<View>(R.id.aiSettingsPanel).visibility == View.VISIBLE)
+        super.onSaveInstanceState(outState)
+    }
 
     private fun fillSettings(s: AiSettings) {
         cbEnabled.isChecked = s.enabled
@@ -117,6 +129,9 @@ class AiActivity : AppCompatActivity() {
         val memory = AiStores.loadMemory()
         val memBlock = if (memory.isEmpty()) "" else
             "【AI 长期记忆】\n" + memory.joinToString("\n") { "· ${it.text}" } + "\n\n————————\n\n"
-        tvLog.text = "AI：${WakeDispatcher.status}\n\n" + memBlock + body
+        val rendered = memBlock + body
+        if (tvLog.text.toString() != rendered) tvLog.text = rendered
+        val status = if (!AiStores.loadSettings().enabled) "尚未启用" else WakeDispatcher.status
+        findViewById<TextView>(R.id.tvAiStatus).let { if (it.text.toString() != status) it.text = status }
     }
 }

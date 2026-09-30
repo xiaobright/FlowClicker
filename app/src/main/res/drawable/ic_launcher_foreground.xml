@@ -6,12 +6,12 @@
     android:viewportHeight="108">
     <!-- 指针光标造型，居中于安全区 -->
     <path
-        android:fillColor="#38BDF8"
+        android:fillColor="#D2F2AF"
         android:pathData="M46,30 L46,74 L56,64 L62,78 L69,75 L63,61 L76,61 Z" />
     <path
-        android:fillColor="#F59E0B"
+        android:fillColor="#A1C9B7"
         android:pathData="M30,44 m-4,0 a4,4 0 1,1 8,0 a4,4 0 1,1 -8,0" />
     <path
-        android:fillColor="#F59E0B"
+        android:fillColor="#A1C9B7"
         android:pathData="M82,44 m-4,0 a4,4 0 1,1 8,0 a4,4 0 1,1 -8,0" />
 </vector>

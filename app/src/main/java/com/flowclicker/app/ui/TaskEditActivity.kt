@@ -24,6 +24,13 @@ import com.flowclicker.app.engine.Trigger
 import com.flowclicker.app.service.RecordingService
 import com.flowclicker.app.engine.MonitoringEngine
 import com.flowclicker.app.core.GestureDispatcher
+import com.flowclicker.app.ui.Ui.add
+import com.flowclicker.app.ui.Ui.dp
+import android.widget.ScrollView
+import android.widget.PopupMenu
+import androidx.activity.OnBackPressedCallback
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 /** 任务编辑器：触发条件 + 动作序列（点击/滑动/等待/标签控制），步骤内支持坐标拾取 */
 class TaskEditActivity : AppCompatActivity() {
@@ -35,6 +42,7 @@ class TaskEditActivity : AppCompatActivity() {
     private var taskId: Long = -1L
     private var original: Task? = null
     private val steps = mutableListOf<Step>()
+    private var initialDraft = ""
 
     private lateinit var etName: EditText
     private lateinit var etTag: EditText
@@ -75,7 +83,7 @@ class TaskEditActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_task_edit)
+        Screens.editor(this, intent.getLongExtra(EXTRA_ID, -1L) >= 0)
         etName = findViewById(R.id.etName)
         etTag = findViewById(R.id.etTag)
         etPriority = findViewById(R.id.etPriority)
@@ -105,6 +113,23 @@ class TaskEditActivity : AppCompatActivity() {
                 steps.addAll(t.steps)
             }
         }
+        // Draft steps are not part of Android's automatic EditText state restoration.
+        savedInstanceState?.getString("draftSteps")?.let {
+            steps.clear()
+            steps.addAll(Json.decodeFromString<List<Step>>(it))
+        }
+        savedInstanceState?.getString("originalTask")?.let { original = Json.decodeFromString<Task>(it) }
+        initialDraft = savedInstanceState?.getString("initialDraft") ?: draftSignature()
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                if (draftSignature() == initialDraft) finish()
+                else AlertDialog.Builder(this@TaskEditActivity)
+                    .setTitle("放弃未保存的修改？")
+                    .setMessage("当前草稿还没有写入任务库。")
+                    .setPositiveButton("放弃修改") { _, _ -> finish() }
+                    .setNegativeButton("继续编辑", null).show()
+            }
+        })
 
         findViewById<Button>(R.id.btnAddClick).setOnClickListener { clickDialog(-1) }
         findViewById<Button>(R.id.btnAddSwipe).setOnClickListener { swipeDialog(-1) }
@@ -136,6 +161,16 @@ class TaskEditActivity : AppCompatActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("draftSteps", Json.encodeToString(steps.toList()))
+        original?.let { outState.putString("originalTask", Json.encodeToString(it)) }
+        outState.putString("initialDraft", initialDraft)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun draftSignature() = listOf(etName, etTag, etPriority, etKeywords, etL, etT, etR, etB)
+        .joinToString("\u0000") { it.text.toString() } + cbLoop.isChecked + Json.encodeToString(steps.toList())
+
     private fun startRecording() {
         if (!GestureDispatcher.isReady) {
             Toast.makeText(this, "先开启无障碍服务", Toast.LENGTH_LONG).show()
@@ -160,30 +195,50 @@ class TaskEditActivity : AppCompatActivity() {
 
     private fun renderSteps() {
         llSteps.removeAllViews()
-        val dp = { v: Int -> (v * resources.displayMetrics.density).toInt() }
-        steps.forEachIndexed { index, s ->
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(6), 0, dp(6))
+        findViewById<TextView>(R.id.tvStepCount).text = "${steps.size} 个步骤"
+        if (steps.isEmpty()) {
+            Ui.card(llSteps, 10) {
+                add(Ui.text(this@TaskEditActivity, "还没有动作", 16, bold = true))
+                add(Ui.text(this@TaskEditActivity, "从下方选择动作，或录制一段操作。", 13, R.color.fc_muted), 6)
             }
-            val tv = TextView(this).apply {
-                text = "${index + 1}. ${describe(s)}"
-                textSize = 13f
-                setOnClickListener { editStep(index) }
-            }
-            val del = Button(this).apply {
-                text = "删"
-                textSize = 12f
-                setOnClickListener {
-                    steps.removeAt(index)
-                    renderSteps()
-                }
-            }
-            row.addView(tv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            row.addView(del)
-            llSteps.addView(row)
         }
+        steps.forEachIndexed { index, s ->
+            Ui.card(llSteps, 10, padding = 16) {
+                add(Ui.text(this@TaskEditActivity, "${(index + 1).toString().padStart(2, '0')}  /  ${stepTitle(s)}", 16, bold = true))
+                add(Ui.text(this@TaskEditActivity, describe(s), 13, R.color.fc_muted), 6)
+                val more = Ui.button(this@TaskEditActivity, "更多", tone = "quiet")
+                more.contentDescription = "步骤 ${index + 1} 更多操作"
+                more.setOnClickListener {
+                    PopupMenu(this@TaskEditActivity, more).apply {
+                        if (index > 0) menu.add("上移")
+                        if (index < steps.lastIndex) menu.add("下移")
+                        menu.add("删除")
+                        setOnMenuItemClickListener { item ->
+                            when (item.title.toString()) {
+                                "上移" -> { java.util.Collections.swap(steps, index, index - 1); renderSteps() }
+                                "下移" -> { java.util.Collections.swap(steps, index, index + 1); renderSteps() }
+                                "删除" -> AlertDialog.Builder(this@TaskEditActivity)
+                                    .setTitle("删除第 ${index + 1} 步？")
+                                    .setPositiveButton("删除") { _, _ -> steps.removeAt(index); renderSteps() }
+                                    .setNegativeButton("取消", null).show()
+                            }
+                            true
+                        }
+                    }.show()
+                }
+                add(Ui.row(this@TaskEditActivity,
+                    Ui.button(this@TaskEditActivity, "编辑步骤", tone = "soft") { editStep(index) }, more), 12)
+            }
+        }
+    }
+
+    private fun stepTitle(s: Step) = when (s) {
+        is Step.Click -> "点击"
+        is Step.Swipe -> "滑动"
+        is Step.Wait -> "等待"
+        is Step.WaitText -> "文字验证"
+        is Step.EnableTagged -> "启用标签组"
+        is Step.DisableTagged -> "停用标签组"
     }
 
     private fun editStep(index: Int) {
@@ -198,31 +253,23 @@ class TaskEditActivity : AppCompatActivity() {
     }
 
     private fun field(container: LinearLayout, label: String, value: String): EditText {
-        val dp = { v: Int -> (v * resources.displayMetrics.density).toInt() }
-        val tv = TextView(this).apply {
-            text = label
-            textSize = 12f
-            setPadding(0, dp(8), 0, 0)
-        }
-        val et = EditText(this).apply { setText(value) }
-        container.addView(tv)
-        container.addView(et)
-        return et
+        return Ui.field(container, label, android.view.View.generateViewId(), value)
     }
 
     private fun dialogContainer(): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(48, 24, 48, 0)
+        setPadding(dp(24), dp(8), dp(24), dp(16))
     }
 
+    private fun scroll(container: LinearLayout) = ScrollView(this).apply { addView(container) }
+
     private fun pickButton(container: LinearLayout, onPicked: (Float, Float) -> Unit): Button =
-        Button(this).apply {
-            text = "拾取坐标（去屏幕上点一下）"
+        Ui.button(this, "从屏幕拾取坐标", tone = "soft").apply {
             setOnClickListener {
                 activePick = onPicked
                 pointPicker.launch(Intent(this@TaskEditActivity, PickPointActivity::class.java))
             }
-            container.addView(this)
+            container.add(this, 12)
         }
 
     private fun Float.str(): String = if (this == toInt().toFloat()) toInt().toString() else toString()
@@ -255,7 +302,7 @@ class TaskEditActivity : AppCompatActivity() {
         }
         AlertDialog.Builder(this)
             .setTitle(if (s == null) "新增点击" else "编辑点击")
-            .setView(c)
+            .setView(scroll(c))
             .setPositiveButton("确定") { _, _ ->
                 val step = Step.Click(
                     x = eX.str().toFloatOrNull() ?: 0f,
@@ -287,7 +334,7 @@ class TaskEditActivity : AppCompatActivity() {
         val eDelayJ = field(c, "延时抖动 ±ms", s?.delayJitterMs?.toString() ?: "200")
         AlertDialog.Builder(this)
             .setTitle(if (s == null) "新增滑动" else "编辑滑动")
-            .setView(c)
+            .setView(scroll(c))
             .setPositiveButton("确定") { _, _ ->
                 val step = Step.Swipe(
                     x1 = eX1.str().toFloatOrNull() ?: 0f,
@@ -311,7 +358,7 @@ class TaskEditActivity : AppCompatActivity() {
         val eMs = field(c, "等待时长 ms", s?.ms?.toString() ?: "1000")
         AlertDialog.Builder(this)
             .setTitle(if (s == null) "新增等待" else "编辑等待")
-            .setView(c)
+            .setView(scroll(c))
             .setPositiveButton("确定") { _, _ ->
                 commitStep(Step.Wait(eMs.str().toLongOrNull() ?: 1000L), index)
             }
@@ -326,7 +373,7 @@ class TaskEditActivity : AppCompatActivity() {
         val timeout = field(c, "超时 ms（500..120000）", (s?.timeoutMs ?: 10000).toString())
         val present = CheckBox(this).apply { this.text = "等待出现（不勾选=等待消失）"; isChecked = s?.present ?: true }
         c.addView(present)
-        AlertDialog.Builder(this).setTitle("等待/验证文字").setView(c)
+        AlertDialog.Builder(this).setTitle("等待/验证文字").setView(scroll(c))
             .setPositiveButton("确定") { _, _ ->
                 commitStep(Step.WaitText(text.str().trim(), present.isChecked,
                     timeout.str().toLongOrNull() ?: 10000, s?.region), index)
@@ -342,7 +389,7 @@ class TaskEditActivity : AppCompatActivity() {
         val eTag = field(c, "标签名（要启用/停用的任务标签组）", existing ?: "")
         AlertDialog.Builder(this)
             .setTitle(if (enable) "启用标签组" else "停用标签组")
-            .setView(c)
+            .setView(scroll(c))
             .setPositiveButton("确定") { _, _ ->
                 val tag = eTag.text.toString().trim()
                 if (tag.isEmpty()) return@setPositiveButton
