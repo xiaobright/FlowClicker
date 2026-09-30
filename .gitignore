@@ -6,3 +6,7 @@ local.properties
 *.iml
 .tools/
 tools/__pycache__/
+.claude/
+*.jks
+*.keystore
+
