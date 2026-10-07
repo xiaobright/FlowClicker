@@ -45,7 +45,9 @@ object WakeDispatcher {
                                         if (SystemClock.elapsedRealtime() - ev.createdAt > 120000) throw CancellationException("事件已过期")
                                         status = "处理 ${ev.type}"
                                         withTimeout(300000) {
-                                            AiSession.run(ev.type, ev.detail, AiStores.loadSettings(), ev.taskId) { checkAllowed(ev.epoch) }
+                                            val settings = AiStores.loadSettings()
+                                            JudgeRouter.route(ev, settings) { checkAllowed(ev.epoch) }
+                                                ?: AiSession.run(ev.type, ev.detail, AiStores.loadSettings(), ev.taskId) { checkAllowed(ev.epoch) }
                                         }
                                     }
                                     AiStores.appendLog(result)
@@ -118,6 +120,8 @@ object WakeDispatcher {
                 is EngineEvent.TaskFinished -> {
                     lastActivity = now
                     taskActivity[e.taskId] = now
+                    // Jev's caller handles recovery failure immediately, without a duplicate AI event.
+                    if (e.recovery) return
                     if (e.result.reason == "已取消") return
                     if (e.manual || !e.completed) {
                         if (e.debugMode || !e.completed) MonitoringEngine.holdForReview(e.taskId)

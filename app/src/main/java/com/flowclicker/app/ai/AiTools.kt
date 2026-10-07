@@ -36,7 +36,7 @@ object AiTools {
 
     @Volatile
     private var lastCrop: CropContext? = null
-    fun clearSession() { lastCrop = null }
+    fun clearSession() { lastCrop = null; JudgeTools.resetBudget() }
 
     /** set_task_mode 转正时通知会话（AiSession 据此生成给下次自己的交接笔记） */
     @Volatile
@@ -101,6 +101,9 @@ object AiTools {
             }
 
             "get_engine_status" -> ok(engineStatus())
+            "get_judge_status" -> ok(JudgeTools.status().toString())
+            "test_judge" -> ok(JudgeTools.test().toString())
+            "judge_screen" -> ok(JudgeTools.screen().toString())
             "get_run_result" -> ok(json.encodeToString(engine().lastResult(args.long("taskId"))))
             "describe_screen" -> describeScreen()
             "get_screenshot" -> {

@@ -11,6 +11,7 @@ import com.flowclicker.app.R
 import com.flowclicker.app.ai.AiLogEntry
 import com.flowclicker.app.ai.AiSettings
 import com.flowclicker.app.ai.AiStores
+import com.flowclicker.app.ai.JudgeSettings
 import com.flowclicker.app.ai.WakeDispatcher
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -30,6 +31,12 @@ class AiActivity : AppCompatActivity() {
     private lateinit var etMaxRounds: EditText
     private lateinit var etDebugRounds: EditText
     private lateinit var etManual: EditText
+    private lateinit var cbJudgeEnabled: CheckBox
+    private lateinit var cbJudgeObserve: CheckBox
+    private lateinit var etJudgeBaseUrl: EditText
+    private lateinit var etJudgeApiKey: EditText
+    private lateinit var etJudgeModel: EditText
+    private lateinit var etJudgeConfidence: EditText
     private lateinit var tvLog: TextView
     private val handler = Handler(Looper.getMainLooper())
     private val refresh = object : Runnable {
@@ -47,6 +54,12 @@ class AiActivity : AppCompatActivity() {
         etMaxRounds = findViewById(R.id.etMaxRounds)
         etDebugRounds = findViewById(R.id.etDebugRounds)
         etManual = findViewById(R.id.etManual)
+        cbJudgeEnabled = findViewById(R.id.cbJudgeEnabled)
+        cbJudgeObserve = findViewById(R.id.cbJudgeObserve)
+        etJudgeBaseUrl = findViewById(R.id.etJudgeBaseUrl)
+        etJudgeApiKey = findViewById(R.id.etJudgeApiKey)
+        etJudgeModel = findViewById(R.id.etJudgeModel)
+        etJudgeConfidence = findViewById(R.id.etJudgeConfidence)
         tvLog = findViewById(R.id.tvLog)
 
         fillSettings(AiStores.loadSettings())
@@ -97,6 +110,12 @@ class AiActivity : AppCompatActivity() {
         etModel.setText(s.model)
         etMaxRounds.setText(s.maxToolRounds.toString())
         etDebugRounds.setText(s.debugRounds.toString())
+        cbJudgeEnabled.isChecked = s.judge.enabled
+        cbJudgeObserve.isChecked = s.judge.observeOnly
+        etJudgeBaseUrl.setText(s.judge.baseUrl)
+        etJudgeApiKey.setText(s.judge.apiKey)
+        etJudgeModel.setText(s.judge.model)
+        etJudgeConfidence.setText(s.judge.minConfidence.toString())
     }
 
     private fun save() {
@@ -108,6 +127,14 @@ class AiActivity : AppCompatActivity() {
             model = etModel.text.toString().trim(),
             maxToolRounds = etMaxRounds.text.toString().toIntOrNull()?.coerceIn(1, 12) ?: 6,
             debugRounds = etDebugRounds.text.toString().toIntOrNull()?.coerceIn(1, 10) ?: 2,
+            judge = JudgeSettings(
+                enabled = cbJudgeEnabled.isChecked,
+                observeOnly = cbJudgeObserve.isChecked,
+                baseUrl = etJudgeBaseUrl.text.toString().trim(),
+                apiKey = etJudgeApiKey.text.toString().trim(),
+                model = etJudgeModel.text.toString().trim(),
+                minConfidence = etJudgeConfidence.text.toString().toDoubleOrNull() ?: Double.NaN,
+            ),
         )
         try {
             AiStores.saveSettings(s)

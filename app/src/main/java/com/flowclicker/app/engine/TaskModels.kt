@@ -96,6 +96,8 @@ data class Task(
     val mode: String = MODE_NORMAL,
     /** Definition version; toggling enabled/mode does not invalidate execution evidence. */
     val revision: Long = 0,
+    /** Optional narrow recovery condition; AI edits still require a fresh debug trial. */
+    val recoveryHint: String = "",
 ) {
     companion object {
         const val MODE_NORMAL = "normal"

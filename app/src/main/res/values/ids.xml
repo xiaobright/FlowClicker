@@ -1,4 +1,11 @@
 <resources>
+    <item name="cbJudgeEnabled" type="id" />
+    <item name="cbJudgeObserve" type="id" />
+    <item name="etJudgeBaseUrl" type="id" />
+    <item name="etJudgeApiKey" type="id" />
+    <item name="etJudgeModel" type="id" />
+    <item name="etJudgeConfidence" type="id" />
+    <item name="etRecoveryHint" type="id" />
     <item name="tvHomeTitle" type="id" />
     <item name="tvTaskSummary" type="id" />
     <item name="tvCaptureStatus" type="id" />

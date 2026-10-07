@@ -46,6 +46,7 @@ class TaskEditActivity : AppCompatActivity() {
 
     private lateinit var etName: EditText
     private lateinit var etTag: EditText
+    private lateinit var etRecoveryHint: EditText
     private lateinit var etPriority: EditText
     private lateinit var cbLoop: CheckBox
     private lateinit var etKeywords: EditText
@@ -86,6 +87,7 @@ class TaskEditActivity : AppCompatActivity() {
         Screens.editor(this, intent.getLongExtra(EXTRA_ID, -1L) >= 0)
         etName = findViewById(R.id.etName)
         etTag = findViewById(R.id.etTag)
+        etRecoveryHint = findViewById(R.id.etRecoveryHint)
         etPriority = findViewById(R.id.etPriority)
         cbLoop = findViewById(R.id.cbLoop)
         etKeywords = findViewById(R.id.etKeywords)
@@ -101,6 +103,7 @@ class TaskEditActivity : AppCompatActivity() {
                 original = t
                 etName.setText(t.name)
                 etTag.setText(t.tag ?: "")
+                etRecoveryHint.setText(t.recoveryHint)
                 etPriority.setText(t.priority.toString())
                 cbLoop.isChecked = t.loop
                 etKeywords.setText(t.trigger.keywords.joinToString(","))
@@ -168,7 +171,7 @@ class TaskEditActivity : AppCompatActivity() {
         super.onSaveInstanceState(outState)
     }
 
-    private fun draftSignature() = listOf(etName, etTag, etPriority, etKeywords, etL, etT, etR, etB)
+    private fun draftSignature() = listOf(etName, etTag, etRecoveryHint, etPriority, etKeywords, etL, etT, etR, etB)
         .joinToString("\u0000") { it.text.toString() } + cbLoop.isChecked + Json.encodeToString(steps.toList())
 
     private fun startRecording() {
@@ -420,6 +423,7 @@ class TaskEditActivity : AppCompatActivity() {
             name = etName.text.toString().trim().ifEmpty { "未命名任务" },
             priority = etPriority.text.toString().toIntOrNull() ?: 0,
             tag = tag,
+            recoveryHint = etRecoveryHint.text.toString().trim(),
             trigger = Trigger(region = regionObj, keywords = keywords, ignoreCase = original?.trigger?.ignoreCase ?: true),
             steps = steps.toList(),
             loop = cbLoop.isChecked,

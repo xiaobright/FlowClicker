@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
+    <!-- User-configured self-hosted endpoints may use HTTP, as in release. -->
+    <base-config cleartextTrafficPermitted="true" />
     <!-- Local fake provider via adb reverse; not included in release. -->
     <domain-config cleartextTrafficPermitted="true">
         <domain>127.0.0.1</domain>

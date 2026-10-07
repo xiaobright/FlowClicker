@@ -80,6 +80,15 @@ object Screens {
                 add(check(a, "模型支持图像输入", R.id.cbVlm), 8)
                 field(this, "单次工具轮数上限（1–12）", R.id.etMaxRounds, type = InputType.TYPE_CLASS_NUMBER)
                 field(this, "复盘轮数（1–10）", R.id.etDebugRounds, type = InputType.TYPE_CLASS_NUMBER)
+                add(text(a, "结构化判断服务（可选，兼容 Jev）", 16, bold = true), 24)
+                add(check(a, "启用判断服务：空闲或衔接超时时判断", R.id.cbJudgeEnabled), 8)
+                add(check(a, "仅记录建议，仍由 AI 处理", R.id.cbJudgeObserve, true), 4)
+                add(text(a, "可连接兼容服务或自建模型。会发送当前屏幕文字、恢复场景与执行结果。关闭“仅记录”后，只运行已验证的恢复任务；不确定时交给 AI。", 12, R.color.fc_muted), 8)
+                field(this, "判断 API 前缀或完整 /systemone 地址", R.id.etJudgeBaseUrl, type = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
+                field(this, "判断服务 API Key · 无鉴权可留空", R.id.etJudgeApiKey, type = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD, password = true)
+                field(this, "判断模型名称", R.id.etJudgeModel)
+                add(text(a, "支持 HTTP/HTTPS；HTTP 会明文传输，请仅用于可信网络。", 12, R.color.fc_muted), 6)
+                field(this, "最低置信门槛（0.5–1，需按实际场景验证）", R.id.etJudgeConfidence, type = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL)
                 add(button(a, "保存配置", R.id.btnSave), 16)
                 add(text(a, "配置仅在保存后生效。关闭 AI 不会自动停止任务引擎。", 12, R.color.fc_muted), 8)
             })
@@ -105,6 +114,9 @@ object Screens {
             field(this, "分组标签（可选）", R.id.etTag)
             field(this, "优先级 · 数字越小越先执行", R.id.etPriority, "0", InputType.TYPE_CLASS_NUMBER)
             add(check(a, "重复触发（关闭后只执行一次）", R.id.cbLoop, true), 8)
+            field(this, "异常恢复适用场景（留空不参与分流）", R.id.etRecoveryHint,
+                type = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE).apply { maxLines = 4 }
+            add(text(a, "例如：连接中断且出现重试按钮。AI 也可编排此字段。仅支持无回退的文字锚点点击、等待与文字验证；须先成功试跑、处于正常模式，重启或修改后需再验证。", 12, R.color.fc_muted), 6)
         }
         card(body) {
             add(text(a, "02  触发条件", 18, bold = true))

@@ -9,6 +9,7 @@ object TaskValidation {
 
     fun validate(task: Task) {
         require(task.name.isNotBlank()) { "任务名不能为空" }
+        require(task.recoveryHint.length <= 400) { "恢复适用场景不能超过 400 字" }
         require(task.mode in setOf(Task.MODE_NORMAL, Task.MODE_DEBUG)) { "mode 无效" }
         region(task.trigger.region)
         require(task.trigger.keywords.all { it.isNotBlank() }) { "关键词不能包含空字符串" }

@@ -11,6 +11,8 @@ AI（OpenAI 兼容 API，多模态可选）在 app 内扮演**编排调度员**�
 
 ## 组件与数据流
 
+可选扩展：`WakeDispatcher` 在 `idle` / `stall` 时先经过 `JudgeRouter`（默认关闭），从已验证的恢复任务中选择；观察模式、判断失败或无法处理时继续进入原 `AiSession`。判断服务兼容 Jev/System One，支持自定义端点与模型。详细边界、内部工具和验证方式见 [STRUCTURED-JUDGE.md](STRUCTURED-JUDGE.md)。
+
 ```
 MonitoringEngine ──事件(TaskFired/TaskFinished)──┐
 RecordingService ──事件(录制完成)───────────────┤

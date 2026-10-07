@@ -20,6 +20,7 @@ data class AiSettings(
     val maxToolRounds: Int = 8,
     /** debug 模式任务跑满多少轮后唤醒 AI 复盘 */
     val debugRounds: Int = 2,
+    val judge: JudgeSettings = JudgeSettings(),
 )
 
 @Serializable
@@ -98,7 +99,7 @@ object AiStores {
     }
 
     fun loadSettings(): AiSettings = read(settingsFile, AiSettings())
-    @Synchronized fun saveSettings(s: AiSettings) = write(settingsFile, s)
+    @Synchronized fun saveSettings(s: AiSettings) { s.judge.validate(); write(settingsFile, s) }
 
     fun loadRules(): List<WakeRule> = read(rulesFile, emptyList())
     @Synchronized fun saveRules(r: List<WakeRule>) = write(rulesFile, r)

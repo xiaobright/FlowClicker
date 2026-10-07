@@ -30,6 +30,24 @@ class CaptureRepairInstrumentation : Instrumentation() {
             // onCreate starts this thread before Application.onCreate has necessarily finished.
             // Take baselines only after its main-thread initialization has completed.
             waitForIdleSync()
+            if (suite == "judge") {
+                JudgeChecks(this).run()
+                results.putString("stream", "JUDGE INTEGRATION CHECKS PASS\n")
+                finish(Activity.RESULT_OK, results)
+                return
+            }
+            if (suite == "judge-real" || suite == "judge-workflow") {
+                JudgeRealChecks(this).run(samples = suite == "judge-real")
+                results.putString("stream", "JUDGE REAL EXPERIMENT PASS\n")
+                finish(Activity.RESULT_OK, results)
+                return
+            }
+            if (suite == "judge-ui") {
+                JudgeUiChecks(this).run()
+                results.putString("stream", "JUDGE UI CHECKS PASS\n")
+                finish(Activity.RESULT_OK, results)
+                return
+            }
             if (suite == "ui") {
                 UiRedesignChecks(this).run()
                 results.putString("stream", "UI REDESIGN CHECKS PASS\n")

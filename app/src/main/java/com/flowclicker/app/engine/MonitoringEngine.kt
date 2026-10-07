@@ -18,6 +18,7 @@ sealed interface EngineEvent {
         val completed: Boolean, val manual: Boolean, val debugMode: Boolean,
         val result: RunResult,
         override val generation: Long,
+        val recovery: Boolean = false,
     ) : EngineEvent
 }
 
@@ -115,6 +116,29 @@ object MonitoringEngine {
         return manualFire.compareAndSet(null, taskId)
     }
 
+    /** Evidence is process-local: after a restart, a recovery must pass a trial again. */
+    fun recoveryTasks(): List<Task> = synchronized(stateLock) {
+        tasks.filter { t ->
+            val r = results[t.id]
+            t.enabled && t.mode == Task.MODE_NORMAL && t.recoveryHint.isNotBlank() &&
+                t.id !in reviewPending && t.steps.lastOrNull() is Step.WaitText &&
+                t.steps.all { step -> when (step) {
+                    is Step.Click -> !step.anchor.isNullOrBlank() && !step.anchorFallback
+                    is Step.Wait, is Step.WaitText -> true
+                    else -> false
+                } } &&
+                r != null && r.revision == t.revision && r.completed && r.verified
+        }.sortedBy { it.priority }
+    }
+
+    /** Called while the dispatcher owns the screen, without a second queue or stale coordinates. */
+    suspend fun runRecovery(task: Task, authorize: () -> Unit): RunResult {
+        check(ScreenControl.owner == "ai" && isMonitoring) { "恢复执行需持有屏幕控制权且引擎运行中" }
+        authorize()
+        check(recoveryTasks().any { it == task }) { "恢复任务已修改、停用或缺少有效验证" }
+        return runTask(task, manual = false, recovery = true, authorize = authorize)
+    }
+
     fun start() = synchronized(lifecycleLock) {
         check(loadError == null) { "任务文件异常：$loadError" }
         check(GestureDispatcher.isReady) { "请先开启无障碍服务" }
@@ -189,7 +213,8 @@ object MonitoringEngine {
         return true
     }
 
-    private suspend fun runTask(task: Task, manual: Boolean, transient: Boolean = false): RunResult {
+    private suspend fun runTask(task: Task, manual: Boolean, transient: Boolean = false,
+                                recovery: Boolean = false, authorize: () -> Unit = {}): RunResult {
         val runGeneration = generation
         var ran = 0
         var completed = false
@@ -201,6 +226,7 @@ object MonitoringEngine {
             TaskValidation.validate(task)
             for ((index, step) in task.steps.withIndex()) {
                 currentCoroutineContext().ensureActive()
+                authorize()
                 if (!transient) {
                     val latest = tasksSnapshot().firstOrNull { it.id == task.id }
                     check(latest != null && latest.revision == task.revision && (manual || latest.enabled)) {
@@ -236,7 +262,7 @@ object MonitoringEngine {
                     if (!completed) reviewPending.add(task.id)
                 }
                 if (generation == runGeneration) emit(EngineEvent.TaskFinished(task.id, task.name, ran, completed, manual,
-                    task.mode == Task.MODE_DEBUG, result, runGeneration))
+                    task.mode == Task.MODE_DEBUG, result, runGeneration, recovery))
             }
         }
         return RunResult(task.id, task.revision, runId, ran, completed,
